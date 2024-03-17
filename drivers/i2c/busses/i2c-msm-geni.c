@@ -372,7 +372,7 @@ static void geni_i2c_err(struct geni_i2c_dev *gi2c, int err)
 			    gi2c_log[err].msg);
 		goto err_ret;
 	} else {
-		I2C_LOG_ERR(gi2c->ipcl, false, gi2c->dev, "%s\n",
+		I2C_LOG_ERR(gi2c->ipcl, true, gi2c->dev, "%s\n",
 			    gi2c_log[err].msg);
 	}
 	geni_i2c_se_dump_dbg_regs(&gi2c->i2c_rsc, gi2c->base, gi2c->ipcl);
@@ -791,10 +791,10 @@ static void gi2c_ev_cb(struct dma_chan *ch, struct msm_gpi_cb const *cb_str,
 		break;
 	}
 	if (cb_str->cb_event != MSM_GPI_QUP_NOTIFY) {
-		I2C_LOG_ERR(gi2c->ipcl, false, gi2c->dev,
-			    "GSI QN err:0x%x, status:0x%x, err:%d\n",
-			    cb_str->error_log.error_code,
-			    m_stat, cb_str->cb_event);
+		I2C_LOG_ERR(gi2c->ipcl, true, gi2c->dev,
+				"GSI QN err:0x%x, status:0x%x, err:%d\n",
+				cb_str->error_log.error_code,
+				m_stat, cb_str->cb_event);
 		gi2c->gsi_err = true;
 		complete(&gi2c->xfer);
 	}
@@ -849,6 +849,11 @@ static void gi2c_gsi_rx_cb(void *ptr)
 	}
 
 	gi2c = rx_cb->userdata;
+	if (!gi2c->cur) {
+		geni_i2c_err(gi2c, GENI_SPURIOUS_IRQ);
+		complete(&gi2c->xfer);
+		return;
+	}
 
 	if (gi2c->cur->flags & I2C_M_RD) {
 		gi2c_gsi_cb_err(rx_cb, "RX");
@@ -2209,6 +2214,9 @@ skip_bw_vote:
 			return ret;
 		}
 
+		geni_write_reg(0x7f, gi2c->base, GENI_OUTPUT_CTRL);
+		udelay(10);
+
 		if (gi2c->se_mode == FIFO_SE_DMA)
 			enable_irq(gi2c->irq);
 
@@ -2354,3 +2362,4 @@ module_init(i2c_dev_init);
 module_exit(i2c_dev_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_ALIAS("platform:i2c_geni");
+
