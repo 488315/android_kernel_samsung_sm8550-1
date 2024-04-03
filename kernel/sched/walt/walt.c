@@ -15,6 +15,7 @@
 #include <linux/cpumask.h>
 #include <linux/arch_topology.h>
 #include <linux/cpu.h>
+#include <linux/of.h>
 
 #include <trace/hooks/sched.h>
 #include <trace/hooks/cgroup.h>
@@ -538,18 +539,19 @@ update_window_start(struct rq *rq, u64 wallclock, int event)
 	bool full_window;
 
 	if (wallclock < wrq->latest_clock) {
-		printk_deferred("WALT-BUG CPU%d; wallclock=%llu(0x%llx) is lesser than latest_clock=%llu(0x%llx) walt_clock_suspended=%d sched_clock_last=%llu(0x%llx)",
+		WALT_BUG(WALT_BUG_WALT, NULL, "on CPU%d; wallclock=%llu(0x%llx) is lesser than latest_clock=%llu(0x%llx) walt_clock_suspended=%d sched_clock_last=%llu(0x%llx)",
 				rq->cpu, wallclock, wallclock, wrq->latest_clock,
 				wrq->latest_clock, walt_clock_suspended,
 				sched_clock_last, sched_clock_last);
-		WALT_PANIC(1);
+		wallclock = wrq->latest_clock;
 	}
 	delta = wallclock - wrq->window_start;
 	if (delta < 0) {
-		printk_deferred("WALT-BUG CPU%d; wallclock=%llu(0x%llx) is lesser than window_start=%llu(0x%llx)",
+		WALT_BUG(WALT_BUG_WALT, NULL, " on CPU%d; wallclock=%llu(0x%llx) is lesser than window_start=%llu(0x%llx)",
 				rq->cpu, wallclock, wallclock,
 				wrq->window_start, wrq->window_start);
-		WALT_PANIC(1);
+		delta = 0;
+		wallclock = max(wallclock, wrq->window_start);
 	}
 	wrq->latest_clock = wallclock;
 	if (delta < sched_ravg_window)
@@ -2372,10 +2374,10 @@ update_task_rq_cpu_cycles(struct task_struct *p, struct rq *rq, int event,
 			time_delta = wallclock - wts->mark_start;
 
 		if ((s64)time_delta < 0) {
-			printk_deferred("WALT-BUG pid=%u CPU%d wallclock=%llu(0x%llx) < mark_start=%llu(0x%llx) event=%d irqtime=%llu",
+			WALT_BUG(WALT_BUG_WALT, p, "WALT-BUG pid=%u CPU%d wallclock=%llu(0x%llx) < mark_start=%llu(0x%llx) event=%d irqtime=%llu",
 					 p->pid, rq->cpu, wallclock, wallclock,
 					 wts->mark_start, wts->mark_start, event, irqtime);
-			WALT_PANIC((s64)time_delta < 0);
+			time_delta = 1;
 		}
 
 		wrq->task_exec_scale = DIV64_U64_ROUNDUP(cycles_delta *
@@ -5310,6 +5312,24 @@ static void android_vh_update_topology_flags_workfn(void *unused, void *unused2)
 	schedule_work(&walt_init_work);
 }
 
+static void walt_devicetree_init(void)
+{
+	struct device_node *np;
+	int ret;
+
+	np = of_find_node_by_name(NULL, "sched_walt");
+	if (!np) {
+		pr_err("Failed to find node of sched_walt\n");
+		return;
+	}
+	
+	ret = of_property_read_u32(np, "panic_on_walt_bug", &sysctl_panic_on_walt_bug);
+	if (ret < 0) {
+		pr_err("Failed to read panic_on_walt_bug property\n");
+		return;
+	}
+}
+
 #define WALT_VENDOR_DATA_SIZE_TEST(wstruct, kstruct)		\
 	BUILD_BUG_ON(sizeof(wstruct) > (sizeof(u64) *		\
 		ARRAY_SIZE(((kstruct *)0)->android_vendor_data1)))
@@ -5320,6 +5340,8 @@ static int walt_module_init(void)
 	WALT_VENDOR_DATA_SIZE_TEST(struct walt_task_struct, struct task_struct);
 	WALT_VENDOR_DATA_SIZE_TEST(struct walt_rq, struct rq);
 	WALT_VENDOR_DATA_SIZE_TEST(struct walt_task_group, struct task_group);
+
+	walt_devicetree_init();
 
 	register_trace_android_vh_update_topology_flags_workfn(
 			android_vh_update_topology_flags_workfn, NULL);

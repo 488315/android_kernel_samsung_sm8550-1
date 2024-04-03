@@ -45,8 +45,12 @@
 #define HALL_DETACH		0
 #endif
 
-#if defined(CONFIG_TABLET_MODEL_CONCEPT)
+#if IS_ENABLED(CONFIG_TABLET_MODEL_CONCEPT)
+#if IS_ENABLED(CONFIG_KEYBOARD_STM32_POGO_V3)
+#include "../input/sec_input/stm32/pogo_notifier_v3.h"
+#elif IS_ENABLED(CONFIG_KEYBOARD_STM32_POGO_V2) || IS_ENABLED(CONFIG_KEYBOARD_STM32_POGO)
 #include <linux/input/pogo_i2c_notifier.h>
+#endif
 #endif
 
 #include "isg6320_reg.h"
@@ -61,7 +65,6 @@
 
 #define ISG6320_INIT_DELAYEDWORK
 #define GRIP_LOG_TIME			5
-#define MAX_I2C_FAIL_COUNT 		3
 
 #define SHCEDULE_INTERVAL       2000  // 2 sec * 5 = 10 sec
 #define SHCEDULE_INTERVAL_MAX   20000 // 20 sec * 5 = 100 sec
@@ -91,16 +94,6 @@ typedef struct {
 } direct_info;
 #pragma pack()
 
-enum grip_error_state {
-	FAIL_UPDATE_PREV_STATE = 0,
-	FAIL_SETUP_REGISTER,
-	FAIL_I2C_ENABLE,
-	FAIL_I2C_READ_3_TIMES,
-	FAIL_DATA_STUCK,
-	FAIL_RESET,
-	FAIL_MCC_RESET
-};
-
 #ifdef CONFIG_USE_MULTI_CHANNEL
 struct multi_channel {
 	int state_a;
@@ -118,14 +111,13 @@ struct multi_channel {
 	int cdc_sum_b;
 	int cdc_avg_b;
 
-	int is_unknown_mode;
-
 	u32 cfcal_th_b;
 	u16 normal_th_b;
 	u16 fine_coarse_b;
-	u8 invalid_count_b;
-
+	int is_unknown_mode;
 	bool first_working;
+	int unknown_ch_selection;
+	int noti_enable;
 };
 #endif
 
@@ -136,7 +128,6 @@ struct isg6320_data {
 	struct device *dev;
 	struct work_struct irq_work;
 	struct work_struct cfcal_work;
-	struct delayed_work invalid_cfcal_work;
 	struct delayed_work cal_work;
 #ifdef ISG6320_INIT_DELAYEDWORK
 	struct delayed_work init_work;
@@ -152,16 +143,15 @@ struct isg6320_data {
 	struct notifier_block hall_nb;
 #endif
 #if defined(CONFIG_TABLET_MODEL_CONCEPT)
+#if IS_ENABLED(CONFIG_KEYBOARD_STM32_POGO_V3) || IS_ENABLED(CONFIG_KEYBOARD_STM32_POGO_V2) || IS_ENABLED(CONFIG_KEYBOARD_STM32_POGO)
 	struct notifier_block pogo_nb;
+#endif
 #endif
 #if IS_ENABLED(CONFIG_FLIP_COVER_DETECTOR_NOTIFIER)
 	struct notifier_block fcd_nb;
 #endif
-#ifdef CONFIG_USE_MULTI_CHANNEL
-	struct multi_channel *mul_ch;
-#endif
-#if defined(CONFIG_SENSORS_DUMP_DATA)
-	struct notifier_block dump_nb;
+#if defined(CONFIG_SENSORS_GRIP_SCANOFF) && !defined(CONFIG_SEC_FACTORY)
+	struct work_struct scanoff_work;
 #endif
 	direct_info direct;
 
@@ -175,18 +165,14 @@ struct isg6320_data {
 	int reg_size;
 
 	int irq_count;
-	int pre_attach;
-	int state;
-	int diff_cnt;
-	int diff_sum;
-	int diff_avg;
-	int cdc_sum;
-	int cdc_avg;
-	int is_unknown_mode;
-	int motion;
-	int otg_attach_state;
+	u16 schedule_time;
+	u8 abnormal_mode;
+	u8 debug_cnt;
 
-	u32 err_state;
+	int pre_attach;
+
+	int state;
+
 	u32 multi_use;
 	u32 cdc;
 	u32 base;
@@ -194,35 +180,36 @@ struct isg6320_data {
 	s32 max_diff;
 	s32 max_normal_diff;
 
+	int diff_cnt;
+	int diff_sum;
+	int diff_avg;
+	int cdc_sum;
+	int cdc_avg;
+
 	u32 cfcal_th;
 	u16 normal_th;
 	u16 fine_coarse;
-	u16 schedule_time;
+
+#ifdef CONFIG_USE_MULTI_CHANNEL
+	struct multi_channel *mul_ch;
+#endif
 
 	u8 setup_reg[320];
 
-	u8 abnormal_mode;
-	u8 debug_cnt;
 	u8 ic_num;
-	u8 i2c_fail_count;
-	u8 invalid_count;
-	u8 reset_fail_cnt;
-	u8 force_report_unknown;
 
 	bool skip_data;
 	bool setup_reg_exist;
 	bool in_suspend;
-	bool check_abnormal_working;
-	bool first_working;
-	bool is_irq_active;
-#if !IS_ENABLED(CONFIG_SAMSUNG_PRODUCT_SHIP)
-	int irq_debug_size;
 
+#if !IS_ENABLED(CONFIG_SAMSUNG_PRODUCT_SHIP)
 	u32 debug_cdc[4];
 	u32 debug_base[2];
 	s32 debug_diff[4];
 
+	int irq_debug_size;
 	u8 irq_debug_addr;
+
 	u8 freq_step;
 	u8 freq_value;
 #endif
@@ -238,23 +225,12 @@ struct isg6320_data {
 	u8 mcc_threshold;
 	u8 mcc_hysteresis;
 #endif
+	int is_unknown_mode;
+	int motion;
+	bool first_working;
+	int unknown_ch_selection;
+	int otg_attach_state;
 };
-
-static void isg6320_enter_unknown_mode(struct isg6320_data *data, int type);
-
-static void isg6320_enter_error_mode(struct isg6320_data *data, enum grip_error_state err_state)
-{
-	if (data->is_irq_active) {
-		disable_irq(data->client->irq);
-		disable_irq_wake(data->client->irq);
-		data->is_irq_active = false;
-	}
-
-	data->check_abnormal_working = true;
-	data->err_state |= 0x1 << err_state;
-	isg6320_enter_unknown_mode(data, TYPE_FORCE);
-	pr_info("[GRIP_%d] %s - %d\n", data->ic_num, __func__, data->err_state);
-}
 
 static void isg6320_set_debug_work(struct isg6320_data *data, bool enable,
 					unsigned int delay_ms);
@@ -274,15 +250,9 @@ static int isg6320_i2c_write(struct isg6320_data *data, u8 cmd, u8 val)
 	msg.buf = buf;
 
 	ret = i2c_transfer(data->client->adapter, &msg, 1);
-	if (ret < 0) {
-		if (data->i2c_fail_count < 3)
-			data->i2c_fail_count++;
-		if (data->i2c_fail_count >= 3)
-			isg6320_enter_error_mode(data, FAIL_I2C_READ_3_TIMES);
-		pr_err("[GRIP_%d] %s fail(%d, %d)\n", data->ic_num, __func__, ret, data->i2c_fail_count);
-	} else {
-		data->i2c_fail_count = 0;
-	}
+	if (ret < 0)
+		pr_err("[GRIP_%d] %s fail(%d)\n", data->ic_num, __func__,
+			ret);
 
 	return ret;
 }
@@ -307,15 +277,9 @@ static int isg6320_i2c_read(struct isg6320_data *data, u8 cmd, u8 *val,
 	};
 
 	ret = i2c_transfer(data->client->adapter, msgs, 2);
-	if (ret < 0) {
-		if (data->i2c_fail_count < 3)
-			data->i2c_fail_count++;
-		if (data->i2c_fail_count >= 3)
-			isg6320_enter_error_mode(data, FAIL_I2C_READ_3_TIMES);
-		pr_err("[GRIP_%d] %s fail(%d, %d)\n", data->ic_num, __func__, ret, data->i2c_fail_count);
-	} else {
-		data->i2c_fail_count = 0;
-	}
+	if (ret < 0)
+		pr_err("[GRIP_%d] %s fail(%d)\n", data->ic_num, __func__,
+			ret);
 
 	return ret;
 }
@@ -377,42 +341,18 @@ static int isg6320_force_calibration(struct isg6320_data *data)
 #if defined(CONFIG_TABLET_MODEL_CONCEPT)
 			pr_info("[GRIP_%d] %s, apply usb burst defense code\n", 
 						data->ic_num, __func__);
-			ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_DFE_ENABLE);
-			if (ret < 0) {
-				pr_err("[GRIP_%d] Tab DFE_ENABLE failed(%d)\n", data->ic_num, ret);
-				goto exit_force_calibration;
-			}
+			isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_DFE_ENABLE);
 			usleep_range(10000, 10010);
-			ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_SCAN_STOP);
-			if (ret < 0) {
-				pr_err("[GRIP_%d] Tab SCAN_STOP failed(%d)\n", data->ic_num, ret);
-				goto exit_force_calibration;
-			}
+			isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_SCAN_STOP);
 			usleep_range(10000, 10010);
-			ret = isg6320_i2c_write(data, ISG6320_A_PROXCTL4_REG, 0xFF);
-			if (ret < 0) {
-				pr_err("[GRIP_%d] Tab CTL4_REG failed(%d)\n", data->ic_num, ret);
-				goto exit_force_calibration;
-			}
-			ret = isg6320_i2c_write(data, ISG6320_A_LSUM_TYPE_REG, 0x10);
-			if (ret < 0) {
-				pr_err("[GRIP_%d] Tab A_LSUM failed(%d)\n", data->ic_num, ret);
-				goto exit_force_calibration;
-			}
+			isg6320_i2c_write(data, ISG6320_A_PROXCTL4_REG, 0xFF);
+			isg6320_i2c_write(data, ISG6320_A_LSUM_TYPE_REG, 0x10);
 #ifdef CONFIG_USE_MULTI_CHANNEL
 			if (data->multi_use) {
 				pr_info("[GRIP_%d] %s, apply usb burst defense code, 2ch\n", 
 							data->ic_num, __func__);
-				ret = isg6320_i2c_write(data, ISG6320_B_PROXCTL4_REG, 0xFF);
-				if (ret < 0) {
-					pr_err("[GRIP_%d] [B] Tab CTL4_REG failed(%d)\n", data->ic_num, ret);
-					goto exit_force_calibration;
-				}
-				ret = isg6320_i2c_write(data, ISG6320_B_LSUM_TYPE_REG, 0x10);
-				if (ret < 0) {
-					pr_err("[GRIP_%d] [B] Tab B_LSUM failed(%d)\n", data->ic_num, ret);
-					goto exit_force_calibration;
-				}
+				isg6320_i2c_write(data, ISG6320_B_PROXCTL4_REG, 0xFF);
+				isg6320_i2c_write(data, ISG6320_B_LSUM_TYPE_REG, 0x10);
 			}
 #endif
 #endif
@@ -427,42 +367,18 @@ static int isg6320_force_calibration(struct isg6320_data *data)
 #if defined(CONFIG_TABLET_MODEL_CONCEPT)
 			pr_info("[GRIP_%d] %s, apply usb burst defense code, recover threshold : %d\n",
 						data->ic_num, __func__, data->lsum_a);
-			ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_DFE_ENABLE);
-			if (ret < 0) {
-				pr_err("[GRIP_%d] Tab DFE_ENABLE failed(%d)\n", data->ic_num, ret);
-				goto exit_force_calibration;
-			}
+			isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_DFE_ENABLE);
 			usleep_range(10000, 10010);
-			ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_SCAN_STOP);
-			if (ret < 0) {
-				pr_err("[GRIP_%d] Tab SCAN_STOP failed(%d)\n", data->ic_num, ret);
-				goto exit_force_calibration;
-			}
+			isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_SCAN_STOP);
 			usleep_range(10000, 10010);
-			ret = isg6320_i2c_write(data, ISG6320_A_PROXCTL4_REG, 0x58);
-			if (ret < 0) {
-				pr_err("[GRIP_%d] Tab CTL4_REG failed(%d)\n", data->ic_num, ret);
-				goto exit_force_calibration;
-			}
-			ret = isg6320_i2c_write(data, ISG6320_A_LSUM_TYPE_REG, data->lsum_a);
-			if (ret < 0) {
-				pr_err("[GRIP_%d] Tab A_LSUM failed(%d)\n", data->ic_num, ret);
-				goto exit_force_calibration;
-			}
+			isg6320_i2c_write(data, ISG6320_A_PROXCTL4_REG, 0x58);
+			isg6320_i2c_write(data, ISG6320_A_LSUM_TYPE_REG, data->lsum_a);
 #ifdef CONFIG_USE_MULTI_CHANNEL
 			if (data->multi_use) {
 				pr_info("[GRIP_%d] %s, apply usb burst defense code, recover 2ch threshold : %d\n",
 							data->ic_num, __func__, data->lsum_b);
-				ret = isg6320_i2c_write(data, ISG6320_B_PROXCTL4_REG, 0x58);
-				if (ret < 0) {
-					pr_err("[GRIP_%d] [B] Tab CTL4_REG failed(%d)\n", data->ic_num, ret);
-					goto exit_force_calibration;
-				}
-				ret = isg6320_i2c_write(data, ISG6320_B_LSUM_TYPE_REG, data->lsum_b);
-				if (ret < 0) {
-					pr_err("[GRIP_%d] [B] Tab B_LSUM failed(%d)\n", data->ic_num, ret);
-					goto exit_force_calibration;
-				}
+				isg6320_i2c_write(data, ISG6320_B_PROXCTL4_REG, 0x58);
+				isg6320_i2c_write(data, ISG6320_B_LSUM_TYPE_REG, data->lsum_b);
 			}
 #endif
 #endif
@@ -476,56 +392,25 @@ static int isg6320_force_calibration(struct isg6320_data *data)
 	while (retry--) {
 		u8 val = 0;
 
-		ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_DFE_ENABLE);
-		if (ret < 0) {
-			pr_err("[GRIP_%d]  failed(%d)\n", data->ic_num, ret);
-			goto exit_force_calibration;
-		}
+		ret = 0;
+
+		isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_DFE_ENABLE);
 		usleep_range(10000, 10010);
-		ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_SCAN_STOP);
-		if (ret < 0) {
-			pr_err("[GRIP_%d]  failed(%d)\n", data->ic_num, ret);
-			goto exit_force_calibration;
-		}
+		isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_SCAN_STOP);
 		usleep_range(10000, 10010);
 #if defined(CONFIG_TABLET_MODEL_CONCEPT)
-		ret = isg6320_i2c_write(data, ISG6320_PROTECT_REG, ISG6320_RST_VALUE);
-		if (ret < 0) {
-			pr_err("[GRIP_%d]  failed(%d)\n", data->ic_num, ret);
-			goto exit_force_calibration;
-		}
-		ret = isg6320_i2c_write(data, ISG6320_RESETCON_REG, ISG6320_DFE_RESET_ON);
-		if (ret < 0) {
-			pr_err("[GRIP_%d]  failed(%d)\n", data->ic_num, ret);
-			goto exit_force_calibration;
-		}
+		isg6320_i2c_write(data, ISG6320_PROTECT_REG, ISG6320_RST_VALUE);
+		isg6320_i2c_write(data, ISG6320_RESETCON_REG, ISG6320_DFE_RESET_ON);
 		usleep_range(10000, 10010);
-		ret = isg6320_i2c_write(data, ISG6320_PROTECT_REG, ISG6320_RST_VALUE);
-		if (ret < 0) {
-			pr_err("[GRIP_%d]  failed(%d)\n", data->ic_num, ret);
-			goto exit_force_calibration;
-		}
-		ret = isg6320_i2c_write(data, ISG6320_RESETCON_REG, ISG6320_DFE_RESET_OFF);
-		if (ret < 0) {
-			pr_err("[GRIP_%d]  failed(%d)\n", data->ic_num, ret);
-			goto exit_force_calibration;
-		}
+		isg6320_i2c_write(data, ISG6320_PROTECT_REG, ISG6320_RST_VALUE);
+		isg6320_i2c_write(data, ISG6320_RESETCON_REG, ISG6320_DFE_RESET_OFF);
 		usleep_range(10000, 10010);
 #endif
-		ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_CFCAL_START);
-		if (ret < 0) {
-			pr_err("[GRIP_%d]  failed(%d)\n", data->ic_num, ret);
-			goto exit_force_calibration;
-		}
+		isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_CFCAL_START);
 		msleep(450);
 
-		ret = isg6320_i2c_read(data, ISG6320_CFCAL_RTN_REG, &val, 1);
-		if (ret < 0) {
-			pr_err("[GRIP_%d]  failed(%d)\n", data->ic_num, ret);
-			goto exit_force_calibration;
-		}
+		isg6320_i2c_read(data, ISG6320_CFCAL_RTN_REG, &val, 1);
 		pr_info("[GRIP_%d] reg read : %02x\n", data->ic_num, val);
-
 		if (!(val & ISG6320_CAL_RTN_A_MASK)) {
 			pr_err("[GRIP_%d] fail calibration(%d)\n", data->ic_num, retry);
 			ret = -EAGAIN;
@@ -538,16 +423,13 @@ static int isg6320_force_calibration(struct isg6320_data *data)
 			}
 		}
 #endif
-
-		if (ret >= 0)
+		if (!ret)
 			break;
 	}
 
-exit_force_calibration:
 	mutex_unlock(&data->lock);
 	if (!data->in_suspend)
 		isg6320_set_debug_work(data, ON, SHCEDULE_INTERVAL + (data->ic_num << 3));
-
 	return ret;
 }
 
@@ -600,11 +482,6 @@ static int isg6320_get_raw_data(struct isg6320_data *data, bool log_print)
 	u32 temp, temp1;
 	bool valid[2] = {true, true};
 
-	if (data->check_abnormal_working == true) {
-		pr_err("[GRIP_%d] %s: abnormal, skip\n", data->ic_num, __func__);
-		return ret;
-	}
-
 	mutex_lock(&data->lock);
 	ret = isg6320_i2c_read(data, ISG6320_CDC16_TA_H_REG, buf, sizeof(buf));
 
@@ -627,9 +504,6 @@ static int isg6320_get_raw_data(struct isg6320_data *data, bool log_print)
 		if (valid[0] && valid[1]) {
 			data->cdc = temp;
 			data->base = temp1;
-			data->invalid_count = 0;
-		} else {
-			data->invalid_count++;
 		}
 
 		data->diff = (s32)data->cdc - (s32)data->base;
@@ -666,9 +540,6 @@ static int isg6320_get_raw_data(struct isg6320_data *data, bool log_print)
 			if (valid[0] && valid[1]) {
 				data->mul_ch->cdc_b = temp;
 				data->mul_ch->base_b = temp1;
-				data->mul_ch->invalid_count_b = 0;
-			} else {
-				data->mul_ch->invalid_count_b++;
 			}
 
 			data->mul_ch->diff_b = (s32)data->mul_ch->cdc_b - (s32)data->mul_ch->base_b;
@@ -684,12 +555,6 @@ static int isg6320_get_raw_data(struct isg6320_data *data, bool log_print)
 #endif
 	mutex_unlock(&data->lock);
 
-	if (data->invalid_count == 0) {
-#ifdef CONFIG_USE_MULTI_CHANNEL	
-		if (data->mul_ch->invalid_count_b == 0)
-#endif
-			data->reset_fail_cnt = 0;
-	}
 	if (log_print || (data->debug_cnt >= GRIP_LOG_TIME)) {
 		pr_info("[GRIP_%d] CapMain: %d%02d, cdc: %d, baseline:%d, diff:%d, "
 				"skip_data:%d\n",
@@ -805,9 +670,7 @@ static void report_event_data(struct isg6320_data *data, u8 irq_msg)
 	}
 #endif
 
-	if (data->check_abnormal_working == true || data->initialized == OFF) {
-		input_report_rel(data->input_dev, REL_MISC, -1);
-	} else if (data->state == CLOSE) {
+	if (data->state == CLOSE) {
 		input_report_rel(data->input_dev, REL_MISC, 1);
 		if (data->is_unknown_mode == UNKNOWN_ON && data->motion)
 			data->first_working = true;
@@ -823,9 +686,7 @@ static void report_event_data(struct isg6320_data *data, u8 irq_msg)
 	}
 #ifdef CONFIG_USE_MULTI_CHANNEL
 	if (data->multi_use) {
-		if (data->check_abnormal_working == true || data->initialized == OFF) {
-			input_report_rel(data->input_dev, REL_DIAL, -1);
-		} else	if (data->mul_ch->state_b == CLOSE) {
+		if (data->mul_ch->state_b == CLOSE) {
 			input_report_rel(data->input_dev, REL_DIAL, 1);
 			if (data->mul_ch->is_unknown_mode == UNKNOWN_ON && data->motion)
 				data->mul_ch->first_working = true;
@@ -856,7 +717,6 @@ static u8 isg6320_read_irqstate(struct isg6320_data *data)
 	u8 irq_msg = 0;
 	int retry = 3;
 	
-	mutex_lock(&data->lock);
 	while (retry--) {
 		ret = isg6320_i2c_read(data, ISG6320_IRQSRC_REG, &irq_msg, 1);
 		if (ret < 0) {
@@ -868,11 +728,8 @@ static u8 isg6320_read_irqstate(struct isg6320_data *data)
 	}
 
 #if !IS_ENABLED(CONFIG_SAMSUNG_PRODUCT_SHIP)
-	if (data->irq_debug_size > 0) {
-		mutex_unlock(&data->lock);
+	if (data->irq_debug_size > 0)
 		isg6320_irq_debug(data);
-		mutex_lock(&data->lock);
-	}
 #endif
 	retry = 3;
 	
@@ -885,7 +742,7 @@ static u8 isg6320_read_irqstate(struct isg6320_data *data)
 		else
 			break;
 	}
-	mutex_unlock(&data->lock);
+
 	return irq_msg;
 }
 
@@ -911,15 +768,9 @@ static void cfcal_work_func(struct work_struct *work)
 {
 	struct isg6320_data *data = container_of((struct work_struct *)work,
 						struct isg6320_data, cfcal_work);
-	int ret = 0;
-
-	if (data->check_abnormal_working == true)
-		return;
 
 	data->schedule_time = SHCEDULE_INTERVAL;
-	ret = isg6320_force_calibration(data);
-	if (ret >= 0)
-		data->reset_fail_cnt = 0;
+	isg6320_force_calibration(data);
 }
 
 #if !defined(CONFIG_SEC_FACTORY) && defined(CONFIG_SUPPORT_MCC_THRESHOLD_CHANGE)
@@ -927,9 +778,8 @@ static void mcc_work_func(struct work_struct *work)
 {
 	struct isg6320_data *data = container_of((struct work_struct *)work,
 						struct isg6320_data, mcc_work);
-	int ret;
 	u8 threshold, hysteresis;
-	u8 val = 0;
+	u8 val;
 
 	// 001 : call box, 440/441 : jpn, 450 : kor, 460 : chn
 	if (data->mcc != 450) {
@@ -946,42 +796,27 @@ static void mcc_work_func(struct work_struct *work)
 	isg6320_set_debug_work(data, OFF, 0);
 
 	mutex_lock(&data->lock);
-	ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_DFE_ENABLE);
-	if (ret < 0)
-		goto exit_mcc_work_func;
+	isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_DFE_ENABLE);
 	usleep_range(10000, 10010);
-	ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_SCAN_STOP);
-	if (ret < 0)
-		goto exit_mcc_work_func;
+	isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_SCAN_STOP);
 	usleep_range(10000, 10010);
 
-	ret = isg6320_i2c_write(data, ISG6320_A_PROXCTL4_REG, threshold);
-	if (ret < 0)
-		goto exit_mcc_work_func;
-	ret = isg6320_i2c_write(data, ISG6320_A_PROXCTL8_REG, hysteresis);
-	if (ret < 0)
-		goto exit_mcc_work_func;
+	isg6320_i2c_write(data, ISG6320_A_PROXCTL4_REG, threshold);
+	isg6320_i2c_write(data, ISG6320_A_PROXCTL8_REG, hysteresis);
 
-	ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_CFCAL_START);
-	if (ret < 0)
-		goto exit_mcc_work_func;
+	isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_CFCAL_START);
 	msleep(450);
 
 	pr_info("[GRIP_%d] %s - change threshold %d,%d\n", data->ic_num, __func__,
 		threshold * 4, threshold * 4 - hysteresis);
 
-	ret = isg6320_i2c_read(data, ISG6320_CFCAL_RTN_REG, &val, 1);
+	isg6320_i2c_read(data, ISG6320_CFCAL_RTN_REG, &val, 1);
 	if (!(val & ISG6320_CAL_RTN_A_MASK))
 		pr_err("[GRIP_%d] %s - fail calibration\n", data->ic_num, __func__);
 
-exit_mcc_work_func:
 	mutex_unlock(&data->lock);
-	if (ret < 0) {
-		isg6320_enter_error_mode(data, FAIL_MCC_RESET);
-		pr_err("[GRIP_%d] %s mcc set failed\n", data->ic_num, __func__);
-	} else {
-		isg6320_set_debug_work(data, ON, SHCEDULE_INTERVAL + (data->ic_num << 3));
-	}
+
+	isg6320_set_debug_work(data, ON, SHCEDULE_INTERVAL + (data->ic_num << 3));
 }
 #endif
 
@@ -1000,64 +835,45 @@ static irqreturn_t isg6320_irq_thread(int irq, void *ptr)
 
 static void isg6320_enter_unknown_mode(struct isg6320_data *data, int type)
 {
+	int noti_enable = 0;
+
 	if (data->noti_enable) {
+		noti_enable = data->noti_enable;
 		data->motion = 0;
 		data->first_working = false;
 		if (data->is_unknown_mode == UNKNOWN_OFF) {
 			data->is_unknown_mode = UNKNOWN_ON;
-			if (!data->skip_data && data->enable) {
+			if (!data->skip_data) {
 				input_report_rel(data->input_dev, REL_X, data->is_unknown_mode);
-				if (data->check_abnormal_working == true)
-					input_report_rel(data->input_dev, REL_MISC, -1);
 				input_sync(data->input_dev);
 			}
 			pr_info("[GRIP_%d] UNKNOWN Re-enter\n", data->ic_num);
 		} else {
-			if (data->check_abnormal_working && data->enable) {
-				input_report_rel(data->input_dev, REL_X, data->is_unknown_mode);
-				input_report_rel(data->input_dev, REL_MISC, -1);
-				input_sync(data->input_dev);
-			}
 			pr_info("[GRIP_%d] already UNKNOWN\n", data->ic_num);
 		}
+	}
 #ifdef CONFIG_USE_MULTI_CHANNEL
-		if (data->multi_use) {
+	if (data->multi_use) {
+		if (data->mul_ch->noti_enable) {
+			noti_enable = data->mul_ch->noti_enable;
+			data->motion = 0;
 			data->mul_ch->first_working = false;
-				if (data->mul_ch->is_unknown_mode == UNKNOWN_OFF) {
-					data->mul_ch->is_unknown_mode = UNKNOWN_ON;
-					if (!data->skip_data && data->enable) {
-						input_report_rel(data->input_dev, REL_Y, data->mul_ch->is_unknown_mode);
-						if (data->check_abnormal_working == true)
-							input_report_rel(data->input_dev, REL_DIAL, -1);
-						input_sync(data->input_dev);
-					}
-					pr_info("[GRIP_%d] [B] UNKNOWN Re-enter\n", data->ic_num);
-				} else {
-					if (data->check_abnormal_working && data->enable) {
-						input_report_rel(data->input_dev, REL_Y, data->mul_ch->is_unknown_mode);
-						input_report_rel(data->input_dev, REL_DIAL, -1);
-						input_sync(data->input_dev);
-					}
-					pr_info("[GRIP_%d] [B] already UNKNOWN\n", data->ic_num);
+			if (data->mul_ch->is_unknown_mode == UNKNOWN_OFF) {
+				data->mul_ch->is_unknown_mode = UNKNOWN_ON;
+				if (!data->skip_data) {
+					input_report_rel(data->input_dev, REL_Y, data->mul_ch->is_unknown_mode);
+					input_sync(data->input_dev);
 				}
+				pr_info("[GRIP_%d] [B] UNKNOWN Re-enter\n", data->ic_num);
+			} else {
+				pr_info("[GRIP_%d] [B] already UNKNOWN\n", data->ic_num);
+			}
 		}
+	}
 #endif
+	if (noti_enable) {
 		input_report_rel(data->noti_input_dev, REL_X, type);
 		input_sync(data->noti_input_dev);
-	} else if (data->check_abnormal_working && data->enable) {
-		if (data->force_report_unknown)
-			data->is_unknown_mode = UNKNOWN_ON;
-		input_report_rel(data->input_dev, REL_X, data->is_unknown_mode);
-		input_report_rel(data->input_dev, REL_MISC, -1);
-#ifdef CONFIG_USE_MULTI_CHANNEL
-		if (data->multi_use) {
-			if (data->force_report_unknown)
-				data->mul_ch->is_unknown_mode = UNKNOWN_ON;
-			input_report_rel(data->input_dev, REL_Y, data->mul_ch->is_unknown_mode);
-			input_report_rel(data->input_dev, REL_DIAL, -1);
-		}
-#endif
-		input_sync(data->input_dev);
 	}
 }
 
@@ -1084,131 +900,103 @@ static void isg6320_initialize(struct isg6320_data *data)
 	int ret;
 	u8 val;
 	u8 buf8[2] = {0, 0};
+#if defined(CONFIG_TABLET_MODEL_CONCEPT)
+	u8 isum_val;
+#endif
 
 	pr_info("[GRIP_%d] %s\n", data->ic_num, __func__);
 	mutex_lock(&data->lock);
-
-	data->initialized = OFF;
 	force_far_grip(data);
 
 	ret = isg6320_i2c_read(data, ISG6320_IRQSRC_REG, &val, 1);
 	if (ret < 0) {
 		pr_err("[GRIP_%d] %s IRQSRC read fail\n", data->ic_num, __func__);
-		goto exit_initialize;
+		mutex_unlock(&data->lock);
+		return;
 	}
 	ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_SCAN_STOP);
 	if (ret < 0) {
 		pr_err("[GRIP_%d] %s SCANCTRL write fail\n", data->ic_num, __func__);
-		goto exit_initialize;
+		mutex_unlock(&data->lock);
+		return;
 	}
 	msleep(30);
 
 	if (data->setup_reg_exist) {
 		int i = 0;
 		for (; i < data->reg_size ; i++) {
-			int index = i << 1;
-			int retry = 2;
-
-			while (retry--) {
-				ret = isg6320_i2c_write(data, data->setup_reg[index],
+			int index = i * 2;
+			isg6320_i2c_write(data, data->setup_reg[index],
 					data->setup_reg[index + 1]);
-				if (ret >= 0)
-					break;
-			}
-
-			if (ret < 0 && retry == 0) {
-				pr_err("[GRIP_%d] %s setup reg fail\n", data->ic_num, __func__);
-				isg6320_enter_error_mode(data, FAIL_SETUP_REGISTER);
-				goto exit_initialize;
-			}
 		}
 	}
 
 	ret = isg6320_i2c_write(data, ISG6320_IRQFUNC_REG, ISG6320_IRQ_DISABLE);
 	if (ret < 0) {
 		pr_err("[GRIP_%d] %s IRQFUNC write fail\n", data->ic_num, __func__);
-		goto exit_initialize;
 	}
 
 	if (data->normal_th > 0) {
-		val = data->normal_th >> 2;
-		ret = isg6320_i2c_write(data, ISG6320_A_PROXCTL4_REG, val);
-		if (ret < 0) {
-			pr_err("[GRIP_%d] %s PROXCTL write fail\n", data->ic_num, __func__);
-			goto exit_initialize;
-		}
+		val = data->normal_th / 4;
+		isg6320_i2c_write(data, ISG6320_A_PROXCTL4_REG, val);
 	}
 #if !defined(CONFIG_SEC_FACTORY) && defined(CONFIG_SUPPORT_MCC_THRESHOLD_CHANGE)
 	if (data->ic_num == MAIN_GRIP) {
-		ret = isg6320_i2c_read(data, ISG6320_A_PROXCTL4_REG, &val, 1);
-		if (ret >= 0)
-			data->default_threshold = val;
+		isg6320_i2c_read(data, ISG6320_A_PROXCTL4_REG, &val, 1);
+		data->default_threshold = val;
 		if (data->mcc_threshold == 0)
 			data->mcc_threshold = data->default_threshold;
 
-		ret = isg6320_i2c_read(data, ISG6320_A_PROXCTL8_REG, &val, 1);
-		if (ret >= 0)
-			data->default_hysteresis = val;
+		isg6320_i2c_read(data, ISG6320_A_PROXCTL8_REG, &val, 1);
+		data->default_hysteresis = val;
 		if (data->mcc_hysteresis == 0)
 			data->mcc_hysteresis = data->default_hysteresis;
 	}
 #endif
+
 #ifdef CONFIG_USE_MULTI_CHANNEL
 	if (data->multi_use) {
 		if (data->mul_ch->normal_th_b > 0) {
-			val = data->mul_ch->normal_th_b >> 2;
-			ret = isg6320_i2c_write(data, ISG6320_B_PROXCTL4_REG, val);
-			if (ret < 0) {
-				pr_err("[GRIP_%d] %s PROXCTL write fail\n", data->ic_num, __func__);
-				goto exit_initialize;
-			}
+			val = data->mul_ch->normal_th_b / 4;
+			isg6320_i2c_write(data, ISG6320_B_PROXCTL4_REG, val);
 		}
 	}
 #endif
 
 #if defined(CONFIG_TABLET_MODEL_CONCEPT)
-	ret = isg6320_i2c_read(data, ISG6320_A_LSUM_TYPE_REG, &val, 1);
+	ret = isg6320_i2c_read(data, ISG6320_A_LSUM_TYPE_REG, &isum_val, 1);
+	data->lsum_a = isum_val;
 	if (ret < 0) {
 		pr_err("[GRIP_%d] %s A_LSUM read fail\n", data->ic_num, __func__);
-		goto exit_initialize;
-	} else {
-		data->lsum_a = val;
+		mutex_unlock(&data->lock);
+		return;
 	}
+
 #ifdef CONFIG_USE_MULTI_CHANNEL
-	ret = isg6320_i2c_read(data, ISG6320_B_LSUM_TYPE_REG, &val, 1);
+	ret = isg6320_i2c_read(data, ISG6320_B_LSUM_TYPE_REG, &isum_val, 1);
+	data->lsum_b = isum_val;
 	if (ret < 0) {
 		pr_err("[GRIP_%d] %s B_LSUM read fail\n", data->ic_num, __func__);
-		goto exit_initialize;
-	} else {
-		data->lsum_b = val;
+		mutex_unlock(&data->lock);
+		return;
 	}
 #endif
 #endif
+
+	mutex_unlock(&data->lock);
+
+	data->initialized = ON;
 
 	isg6320_set_normal_mode(data);
 
-	ret = isg6320_i2c_read(data, ISG6320_A_PROXCTL4_REG, buf8, sizeof(buf8));
-	if (ret < 0) {
-		pr_err("[GRIP_%d] %s normal_th read fail\n", data->ic_num, __func__);
-		goto exit_initialize;
-	} else {
-		data->normal_th = (u32)buf8[0] << 2;
-	}
+	isg6320_i2c_read(data, ISG6320_A_PROXCTL4_REG, buf8, sizeof(buf8));
+	data->normal_th = (u32)buf8[0] * 4;
 #ifdef CONFIG_USE_MULTI_CHANNEL
 	if (data->multi_use) {
-		ret = isg6320_i2c_read(data, ISG6320_B_PROXCTL4_REG, buf8, sizeof(buf8));
-		if (ret < 0) {
-			pr_err("[GRIP_%d] %s normal_th_b read fail\n", data->ic_num, __func__);
-			goto exit_initialize;
-		} else {
-			data->mul_ch->normal_th_b = (u32)buf8[0] << 2;
-		}
+		isg6320_i2c_read(data, ISG6320_B_PROXCTL4_REG, buf8, sizeof(buf8));
+		data->mul_ch->normal_th_b = (u32)buf8[0] * 4;
 	}
 #endif
-	data->initialized = ON;
-
-exit_initialize:
-	mutex_unlock(&data->lock);
 }
 
 static void isg6320_set_debug_work(struct isg6320_data *data, bool enable,
@@ -1216,8 +1004,7 @@ static void isg6320_set_debug_work(struct isg6320_data *data, bool enable,
 {
 	if (enable == ON) {
 		data->debug_cnt = GRIP_LOG_TIME;
-		if (data->check_abnormal_working == false)
-			schedule_delayed_work(&data->cal_work, msecs_to_jiffies(delay_ms));
+		schedule_delayed_work(&data->cal_work, msecs_to_jiffies(delay_ms));
 	} else {
 		cancel_delayed_work_sync(&data->cal_work);
 	}
@@ -1225,7 +1012,7 @@ static void isg6320_set_debug_work(struct isg6320_data *data, bool enable,
 
 static void isg6320_set_enable(struct isg6320_data *data, int enable)
 {
-	u8 state = 0;
+	u8 state;
 	int ret = 0;
 	int retry = 3;
 
@@ -1236,19 +1023,9 @@ static void isg6320_set_enable(struct isg6320_data *data, int enable)
 		return;
 	}
 
-	if (data->check_abnormal_working == true) {
-		data->enable = enable;
-
-		if (enable == ON) {
-			pr_info("[GRIP_%d] abnormal working\n", data->ic_num);
-			isg6320_enter_error_mode(data, FAIL_UPDATE_PREV_STATE);
-		}
-
-		return;
-	}
-
 	if (enable == ON) {
 		pr_info("[GRIP_%d] %s enable\n", data->ic_num, __func__);
+
 		data->diff_avg = 0;
 		data->diff_cnt = 0;
 		data->cdc_avg = 0;
@@ -1266,13 +1043,6 @@ static void isg6320_set_enable(struct isg6320_data *data, int enable)
 				pr_err("[GRIP_%d] %s IRQSTS read fail\n", data->ic_num, __func__);
 			else
 				break;
-		}
-
-		if (data->check_abnormal_working == true || data->initialized == OFF) {
-			data->enable = enable;
-			isg6320_enter_error_mode(data, FAIL_I2C_ENABLE);
-			pr_info("[GRIP_%d] %s enter abnormal mode\n", data->ic_num, __func__);
-			return;
 		}
 
 		isg6320_get_raw_data(data, true);
@@ -1327,11 +1097,9 @@ static void isg6320_set_enable(struct isg6320_data *data, int enable)
 #else
 		isg6320_i2c_write(data, ISG6320_IRQFUNC_REG, ISG6320_IRQ_ENABLE_A);
 #endif
-		if (data->is_irq_active == false) {
-			enable_irq(data->client->irq);
-			enable_irq_wake(data->client->irq);
-			data->is_irq_active = true;
-		}
+
+		enable_irq(data->client->irq);
+		enable_irq_wake(data->client->irq);
 	} else {
 		pr_info("[GRIP_%d] %s disable\n", data->ic_num, __func__);
 
@@ -1343,11 +1111,8 @@ static void isg6320_set_enable(struct isg6320_data *data, int enable)
 				break;
 		}
 
-		if (data->is_irq_active) {
-			disable_irq(data->client->irq);
-			disable_irq_wake(data->client->irq);
-			data->is_irq_active = false;
-		}
+		disable_irq(data->client->irq);
+		disable_irq_wake(data->client->irq);
 	}
 
 	data->enable = enable;
@@ -1367,7 +1132,7 @@ static ssize_t isg6320_vendor_show(struct device *dev,
 					struct device_attribute *attr, char *buf)
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
-	pr_info("[GRIP_%d] %s %s\n", data->ic_num, __func__, VENDOR_NAME);
+	pr_info("[GRIP_%d] %s%s\n", data->ic_num, __func__, VENDOR_NAME);
 
 	return sprintf(buf, "%s\n", VENDOR_NAME);
 }
@@ -1375,10 +1140,6 @@ static ssize_t isg6320_vendor_show(struct device *dev,
 static ssize_t isg6320_mode_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
 {
-#if 0
-	struct isg6320_data *data = dev_get_drvdata(dev);
-	isg6320_enter_error_mode(data, FAIL_UPDATE_PREV_STATE);
-#endif
 	return sprintf(buf, "1\n");
 }
 
@@ -1462,16 +1223,12 @@ static ssize_t isg6320_sw_reset_show(struct device *dev,
 
 	cancel_delayed_work_sync(&data->cal_work);
 
-	if (data->check_abnormal_working == true)
-		return sprintf(buf, "-1\n");
-
 	ret = isg6320_force_calibration(data);
 	isg6320_get_raw_data(data, true);
 
-	if (data->check_abnormal_working == false)
-		schedule_delayed_work(&data->cal_work, msecs_to_jiffies(1000));
+	schedule_delayed_work(&data->cal_work, msecs_to_jiffies(1000));
 
-	if (ret < 0)
+	if (ret)
 		return sprintf(buf, "-1\n");
 
 	return sprintf(buf, "%d\n", 0);
@@ -1486,8 +1243,8 @@ static ssize_t isg6320_normal_threshold_store(struct device *dev,
 
 	sscanf(buf, "%d", &val);
 
-	if (val < 0 && data->check_abnormal_working == true) {
-		pr_err("[GRIP_%d] invalid argument & %d\n", data->ic_num, data->check_abnormal_working ? 1 : 0);
+	if (val < 0) {
+		pr_err("[GRIP_%d] invalid argument\n", data->ic_num);
 		return size;
 	}
 
@@ -1511,12 +1268,10 @@ static ssize_t isg6320_normal_threshold_show(struct device *dev,
 	u8 buf8[2];
 	struct isg6320_data *data = dev_get_drvdata(dev);
 
-	if (data->check_abnormal_working == false) {
-		isg6320_i2c_read(data, ISG6320_A_PROXCTL4_REG, buf8, sizeof(buf8));
+	isg6320_i2c_read(data, ISG6320_A_PROXCTL4_REG, buf8, sizeof(buf8));
 
-		threshold = (u32)buf8[0] * 4;
-		hyst = buf8[1];
-	}
+	threshold = (u32)buf8[0] * 4;
+	hyst = buf8[1];
 
 	return sprintf(buf, "%d,%d\n", threshold, threshold - hyst);
 }
@@ -1526,29 +1281,21 @@ static ssize_t isg6320_raw_data_show(struct device *dev,
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
 
-	if (data->check_abnormal_working == true) {
-		data->diff_sum = 0;
-		data->cdc_sum  = 0;
-		data->diff_avg = 0;
-		data->cdc_avg = 0;
-		data->diff_cnt = 0;
-		data->base = 0;
+	isg6320_get_raw_data(data, true);
+	if (data->diff_cnt == 0) {
+		data->diff_sum = data->diff;
+		data->cdc_sum = data->cdc;
 	} else {
-		isg6320_get_raw_data(data, true);
-		if (data->diff_cnt == 0) {
-			data->diff_sum = data->diff;
-			data->cdc_sum = data->cdc;
-		} else {
-			data->diff_sum += data->diff;
-			data->cdc_sum += data->cdc;
-		}
-
-		if (++data->diff_cnt >= ISG6320_DIFF_AVR_CNT) {
-			data->diff_avg = data->diff_sum / ISG6320_DIFF_AVR_CNT;
-			data->cdc_avg = data->cdc_sum / ISG6320_DIFF_AVR_CNT;
-			data->diff_cnt = 0;
-		}
+		data->diff_sum += data->diff;
+		data->cdc_sum += data->cdc;
 	}
+
+	if (++data->diff_cnt >= ISG6320_DIFF_AVR_CNT) {
+		data->diff_avg = data->diff_sum / ISG6320_DIFF_AVR_CNT;
+		data->cdc_avg = data->cdc_sum / ISG6320_DIFF_AVR_CNT;
+		data->diff_cnt = 0;
+	}
+
 	return sprintf(buf, "%d%02d,%d,%d,%d,%d\n", (data->fine_coarse & 0xFF),
 			   ((data->fine_coarse >> 8) & 0x3F), data->cdc,
 			   data->fine_coarse, data->diff, data->base);
@@ -1596,7 +1343,7 @@ static ssize_t isg6320_ch_state_show(struct device *dev,
 static ssize_t isg6320_hysteresis_show(struct device *dev,
 					struct device_attribute *attr, char *buf)
 {
-	u8 buf8 = 0;
+	u8 buf8;
 	struct isg6320_data *data = dev_get_drvdata(dev);
 
 	isg6320_i2c_read(data, ISG6320_A_PROXCTL8_REG, &buf8, 1);
@@ -1610,12 +1357,10 @@ static ssize_t isg6320_sampling_freq_show(struct device *dev,
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
 	u8 buff;
-	int sampling_freq = 0;
+	int sampling_freq;
 
-	if (data->check_abnormal_working == false) {
-		isg6320_i2c_read(data, ISG6320_NUM_OF_CLK, &buff, 1);
-		sampling_freq = (int)(8000 / ((int)buff + 1));
-	}
+	isg6320_i2c_read(data, ISG6320_NUM_OF_CLK, &buff, 1);
+	sampling_freq = (int)(8000 / ((int)buff + 1));
 
 	return snprintf(buf, PAGE_SIZE, "%dkHz\n", sampling_freq);
 }
@@ -1640,7 +1385,7 @@ static ssize_t isg6320_scan_period_show(struct device *dev,
 					 struct device_attribute *attr, char *buf)
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
-	u8 buff[2] = {0, 0};
+	u8 buff[2];
 	int scan_period;
 
 	isg6320_i2c_read(data, ISG6320_WUTDATA_REG, (u8 *)&buff, sizeof(buff));
@@ -1658,7 +1403,7 @@ static ssize_t isg6320_again_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
-	u8 buff = 0;
+	u8 buff;
 	u8 temp1, temp2;
 
 	isg6320_i2c_read(data, ISG6320_A_ANALOG_GAIN, &buff, 1);
@@ -1672,7 +1417,7 @@ static ssize_t isg6320_cdc_up_coef_show(struct device *dev,
 					 struct device_attribute *attr, char *buf)
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
-	u8 buff = 0;
+	u8 buff;
 	int coef;
 
 	isg6320_i2c_read(data, ISG6320_A_CDC_UP_COEF_REG, &buff, 1);
@@ -1685,7 +1430,7 @@ static ssize_t isg6320_cdc_down_coef_show(struct device *dev,
 					   struct device_attribute *attr, char *buf)
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
-	u8 buff = 0;
+	u8 buff;
 	int coef;
 
 	isg6320_i2c_read(data, ISG6320_A_CDC_DN_COEF_REG, &buff, 1);
@@ -1698,7 +1443,7 @@ static ssize_t isg6320_temp_enable_show(struct device *dev,
 					 struct device_attribute *attr, char *buf)
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
-	u8 buff = 0;
+	u8 buff;
 
 	isg6320_i2c_read(data, ISG6320_A_TEMPERATURE_ENABLE_REG, &buff, 1);
 
@@ -1710,16 +1455,14 @@ static ssize_t isg6320_irq_count_show(struct device *dev,
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
 
-	int ret = -1;
-	s16 max_diff_val = 0;
+	int ret = 0;
+	s16 max_diff_val;
 
-	if (data->check_abnormal_working == false) {
-		if (data->irq_count) {
-			max_diff_val = data->max_diff;
-		} else {
-			ret = 0;
-			max_diff_val = data->max_normal_diff;
-		}
+	if (data->irq_count) {
+		ret = -1;
+		max_diff_val = data->max_diff;
+	} else {
+		max_diff_val = data->max_normal_diff;
 	}
 
 	pr_info("[GRIP_%d] %s - called\n", data->ic_num, __func__);
@@ -1802,9 +1545,7 @@ static ssize_t isg6320_unknown_state_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
-
-	if (data->check_abnormal_working)
-		return snprintf(buf, PAGE_SIZE, "%s\n", "UNKNOWN");
+	
 	return snprintf(buf, PAGE_SIZE, "%s\n",
 		(data->is_unknown_mode == 1) ? "UNKNOWN" : "NORMAL");
 }
@@ -1837,13 +1578,22 @@ static ssize_t isg6320_unknown_state_store(struct device *dev,
 	pr_info("[GRIP_%d] %s - %u\n", data->ic_num, __func__, val);
 	return count;
 }
+#if 0
+static ssize_t isg6320_cml_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct isg6320_data *data = dev_get_drvdata(dev);
 
+	return snprintf(buf, PAGE_SIZE, "%s/%s\n",
+		(data->motion) ? "MOTION_DETECT" : "MOTION_NON_DETECT", (data->is_unknown_mode == 1) ? "UNKNOWN" : "NORMAL");
+}
+#endif
 #ifdef CONFIG_USE_MULTI_CHANNEL
 static ssize_t isg6320_normal_threshold_b_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t size)
 {
 	int val = 0;
-	u8 buf8 = 0;
+	u8 buf8;
 	struct isg6320_data *data = dev_get_drvdata(dev);
 
 	sscanf(buf, "%d", &val);
@@ -1870,7 +1620,7 @@ static ssize_t isg6320_normal_threshold_b_show(struct device *dev,
 {
 	u32 threshold = 0;
 	u32 hyst = 0;
-	u8 buf8[2] = {0, 0};
+	u8 buf8[2];
 	struct isg6320_data *data = dev_get_drvdata(dev);
 
 	isg6320_i2c_read(data, ISG6320_B_PROXCTL4_REG, buf8, sizeof(buf8));
@@ -1886,19 +1636,13 @@ static ssize_t isg6320_raw_data_b_show(struct device *dev,
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
 
-	if (data->check_abnormal_working == false) {
-		isg6320_get_raw_data(data, true);
-		if (data->mul_ch->diff_cnt_b == 0) {
-			data->mul_ch->diff_sum_b = data->mul_ch->diff_b;
-			data->mul_ch->cdc_sum_b = data->mul_ch->cdc_b;
-		} else {
-			data->mul_ch->diff_sum_b += data->mul_ch->diff_b;
-			data->mul_ch->cdc_sum_b += data->mul_ch->cdc_b;
-		}
+	isg6320_get_raw_data(data, true);
+	if (data->mul_ch->diff_cnt_b == 0) {
+		data->mul_ch->diff_sum_b = data->mul_ch->diff_b;
+		data->mul_ch->cdc_sum_b = data->mul_ch->cdc_b;
 	} else {
-		data->mul_ch->cdc_b = 0;
-		data->mul_ch->diff_b = 0;
-		data->mul_ch->base_b =0;
+		data->mul_ch->diff_sum_b += data->mul_ch->diff_b;
+		data->mul_ch->cdc_sum_b += data->mul_ch->cdc_b;
 	}
 
 	if (++data->mul_ch->diff_cnt_b >= ISG6320_DIFF_AVR_CNT) {
@@ -1937,7 +1681,7 @@ static ssize_t isg6320_cdc_avg_b_show(struct device *dev,
 static ssize_t isg6320_hysteresis_b_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	u8 buf8 = 0;
+	u8 buf8;
 	struct isg6320_data *data = dev_get_drvdata(dev);
 
 	isg6320_i2c_read(data, ISG6320_B_PROXCTL8_REG, &buf8, 1);
@@ -1965,7 +1709,7 @@ static ssize_t isg6320_again_b_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
-	u8 buff = 0;
+	u8 buff;
 	u8 temp1, temp2;
 
 	isg6320_i2c_read(data, ISG6320_B_ANALOG_GAIN, &buff, 1);
@@ -1979,7 +1723,7 @@ static ssize_t isg6320_cdc_up_coef_b_show(struct device *dev,
 					 struct device_attribute *attr, char *buf)
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
-	u8 buff = 0;
+	u8 buff;
 	int coef;
 
 	isg6320_i2c_read(data, ISG6320_B_CDC_UP_COEF_REG, &buff, 1);
@@ -1992,7 +1736,7 @@ static ssize_t isg6320_cdc_down_coef_b_show(struct device *dev,
 					   struct device_attribute *attr, char *buf)
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
-	u8 buff = 0;
+	u8 buff;
 	int coef;
 
 	isg6320_i2c_read(data, ISG6320_B_CDC_DN_COEF_REG, &buff, 1);
@@ -2005,7 +1749,7 @@ static ssize_t isg6320_temp_enable_b_show(struct device *dev,
 					 struct device_attribute *attr, char *buf)
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
-	u8 buff = 0;
+	u8 buff;
 
 	isg6320_i2c_read(data, ISG6320_B_TEMPERATURE_ENABLE_REG, &buff, 1);
 
@@ -2017,16 +1761,14 @@ static ssize_t isg6320_irq_count_b_show(struct device *dev,
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
 
-	int ret = -1;
+	int ret = 0;
 	s16 max_diff_b_val = 0;
 
-	if (data->check_abnormal_working == false) {
-		if (data->irq_count) {
-			max_diff_b_val = data->mul_ch->max_diff_b;
-		} else {
-			ret = 0;
-			max_diff_b_val = data->mul_ch->max_normal_diff_b;
-		}
+	if (data->irq_count) {
+		ret = -1;
+		max_diff_b_val = data->mul_ch->max_diff_b;
+	} else {
+		max_diff_b_val = data->mul_ch->max_normal_diff_b;
 	}
 
 	pr_info("[GRIP_%d] %s called\n", data->ic_num, __func__);
@@ -2074,19 +1816,17 @@ static ssize_t isg6320_sampling_freq_b_show(struct device *dev,
 					   struct device_attribute *attr, char *buf)
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
-	u8 buff = 0;
-	int sampling_freq = 0;
+	u8 buff;
+	int sampling_freq;
 
-	if (data->check_abnormal_working == false) {
-		isg6320_i2c_read(data, ISG6320_SCANCTRL13_REG, &buff, 1);
+	isg6320_i2c_read(data, ISG6320_SCANCTRL13_REG, &buff, 1);
 
-		if (buff & 0x04)
-			isg6320_i2c_read(data, ISG6320_NUM_OF_CLK_B, &buff, 1);
-		else
-			isg6320_i2c_read(data, ISG6320_NUM_OF_CLK, &buff, 1);
-		
-		sampling_freq = (int)(8000 / ((int)buff + 1));
-	}
+	if (buff & 0x04)
+		isg6320_i2c_read(data, ISG6320_NUM_OF_CLK_B, &buff, 1);
+	else
+		isg6320_i2c_read(data, ISG6320_NUM_OF_CLK, &buff, 1);
+
+	sampling_freq = (int)(8000 / ((int)buff + 1));
 
 	return snprintf(buf, PAGE_SIZE, "%dkHz\n", sampling_freq);
 }
@@ -2145,60 +1885,54 @@ static ssize_t isg6320_debug_raw_data_show(struct device *dev,
 	u16 temp;
 	struct isg6320_data *data = dev_get_drvdata(dev);
 
-	if (data->check_abnormal_working == false) {
-		mutex_lock(&data->lock);
-		ret = isg6320_i2c_read(data, ISG6320_CDC16_A_H_REG, buff, sizeof(buff));
-		if (ret < 0) {
-			pr_info("[GRIP_%d] fail to get A data\n", data->ic_num);
-		} else {
-			ret = isg6320_i2c_read(data, ISG6320_CDC16_B_H_REG, buff2,
-					sizeof(buff2));
-			if (ret < 0) {
-				pr_info("[GRIP_%d] fail to get B data\n", data->ic_num);
-			} else {
-				temp = ((u32)buff[0] << 8) | (u32)buff[1];
-				if ((temp != 0) && (temp != 0xFFFF))
-					data->debug_cdc[0] = temp;
-
-				temp = ((u32)buff[2] << 8) | (u32)buff[3];
-				if ((temp != 0) && (temp != 0xFFFF))
-					data->debug_cdc[1] = temp;
-
-				temp = ((u32)buff[4] << 8) | (u32)buff[5];
-				if ((temp != 0) && (temp != 0xFFFF))
-					data->debug_base[0] = temp;
-
-				data->debug_diff[0] =
-					(s32)data->debug_cdc[0] - (s32)data->debug_base[0];
-
-				data->debug_diff[1] =
-					(s32)data->debug_cdc[1] - (s32)data->debug_base[0];
-
-				temp = ((u32)buff2[0] << 8) | (u32)buff2[1];
-				if ((temp != 0) && (temp != 0xFFFF))
-					data->debug_cdc[2] = temp;
-
-				temp = ((u32)buff2[2] << 8) | (u32)buff2[3];
-				if ((temp != 0) && (temp != 0xFFFF))
-					data->debug_cdc[3] = temp;
-
-				temp = ((u32)buff2[4] << 8) | (u32)buff2[5];
-				if ((temp != 0) && (temp != 0xFFFF))
-					data->debug_base[1] = temp;
-
-				data->debug_diff[2] =
-					(s32)data->debug_cdc[2] - (s32)data->debug_base[1];
-
-				data->debug_diff[3] =
-					(s32)data->debug_cdc[3] - (s32)data->debug_base[1];
-			}
-		}
-		mutex_unlock(&data->lock);
+	mutex_lock(&data->lock);
+	ret = isg6320_i2c_read(data, ISG6320_CDC16_A_H_REG, buff, sizeof(buff));
+	if (ret < 0) {
+		pr_info("[GRIP_%d] fail to get A data\n", data->ic_num);
 	} else {
-		memset(data->debug_cdc, 0, sizeof(u32) * 4);
-		memset(data->debug_diff, 0, sizeof(u32) * 4);
-		memset(data->debug_base, 0, sizeof(u32) * 2);
+		ret = isg6320_i2c_read(data, ISG6320_CDC16_B_H_REG, buff2,
+				sizeof(buff2));
+		if (ret < 0) {
+			pr_info("[GRIP_%d] fail to get B data\n", data->ic_num);
+		} else {
+			temp = ((u32)buff[0] << 8) | (u32)buff[1];
+			if ((temp != 0) && (temp != 0xFFFF))
+				data->debug_cdc[0] = temp;
+
+			temp = ((u32)buff[2] << 8) | (u32)buff[3];
+			if ((temp != 0) && (temp != 0xFFFF))
+				data->debug_cdc[1] = temp;
+
+			temp = ((u32)buff[4] << 8) | (u32)buff[5];
+			if ((temp != 0) && (temp != 0xFFFF))
+				data->debug_base[0] = temp;
+
+			data->debug_diff[0] =
+				(s32)data->debug_cdc[0] - (s32)data->debug_base[0];
+
+			data->debug_diff[1] =
+				(s32)data->debug_cdc[1] - (s32)data->debug_base[0];
+
+			temp = ((u32)buff2[0] << 8) | (u32)buff2[1];
+			if ((temp != 0) && (temp != 0xFFFF))
+				data->debug_cdc[2] = temp;
+
+			temp = ((u32)buff2[2] << 8) | (u32)buff2[3];
+			if ((temp != 0) && (temp != 0xFFFF))
+				data->debug_cdc[3] = temp;
+
+			temp = ((u32)buff2[4] << 8) | (u32)buff2[5];
+			if ((temp != 0) && (temp != 0xFFFF))
+				data->debug_base[1] = temp;
+
+			data->debug_diff[2] =
+				(s32)data->debug_cdc[2] - (s32)data->debug_base[1];
+
+			data->debug_diff[3] =
+				(s32)data->debug_cdc[3] - (s32)data->debug_base[1];
+		}
 	}
+	mutex_unlock(&data->lock);
 
 	return sprintf(buf, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", data->debug_cdc[0],
 			data->debug_diff[0], data->debug_base[0], data->debug_cdc[1],
@@ -2211,11 +1945,6 @@ static ssize_t isg6320_debug_data_show(struct device *dev,
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
 
-	if (data->check_abnormal_working == true) {
-		data->cdc = 0;
-		data->base = 0;
-		data->diff = 0;
-	}
 	return sprintf(buf, "%d,%d,%d\n", data->cdc, data->base, data->diff);
 }
 
@@ -2524,6 +2253,7 @@ static ssize_t isg6320_noti_enable_store(struct device *dev,
 {
 	int ret;
 	u8 enable;
+	int noti_enable = 0;
 	struct isg6320_data *data = dev_get_drvdata(dev);
 
 	ret = kstrtou8(buf, 2, &enable);
@@ -2532,11 +2262,18 @@ static ssize_t isg6320_noti_enable_store(struct device *dev,
 		return size;
 	}
 
-	pr_info("[GRIP_%d] %s new_value=%u\n", data->ic_num, __func__, enable);
+	pr_info("[GRIP_%d] new_value=%d\n", data->ic_num, __func__, (int)enable);
 
-	data->noti_enable = enable;
+	if (data->unknown_ch_selection & 1)
+		data->noti_enable = noti_enable = enable;
 
-	if (data->noti_enable)
+#ifdef CONFIG_USE_MULTI_CHANNEL
+	if (data->multi_use) {
+		if (data->unknown_ch_selection & 2)
+			data->mul_ch->noti_enable = noti_enable = enable;
+	}
+#endif
+	if (noti_enable)
 		isg6320_enter_unknown_mode(data, TYPE_BOOT);
 
 	return size;
@@ -2547,7 +2284,13 @@ static ssize_t isg6320_noti_enable_show(struct device *dev,
 {
 	struct isg6320_data *data = dev_get_drvdata(dev);
 
-	pr_info("[GRIP_%d] %s - noti_enable = %d\n", data->ic_num, __func__, data->noti_enable);
+#ifdef CONFIG_USE_MULTI_CHANNEL
+	if (data->multi_use)
+		pr_info("[GRIP_%d] %s - noti_enable = %d %d\n", data->ic_num, __func__, data->noti_enable, data->mul_ch->noti_enable);
+	else
+#endif
+		pr_info("[GRIP_%d] %s - noti_enable = %d\n", data->ic_num, __func__, data->noti_enable);
+
 	return sprintf(buf, "%d\n", data->noti_enable);
 }
 
@@ -2614,6 +2357,7 @@ static DEVICE_ATTR(noti_enable, 0664, isg6320_noti_enable_show, isg6320_noti_ena
 #if defined(CONFIG_TABLET_MODEL_CONCEPT)
 static DEVICE_ATTR(country_code, 0664, isg6320_country_code_show, isg6320_country_code_store);
 #endif
+//static DEVICE_ATTR(cml, S_IRUGO, isg6320_cml_show, NULL);
 #ifdef CONFIG_USE_MULTI_CHANNEL
 static DEVICE_ATTR(normal_threshold_b, 0664,
 		isg6320_normal_threshold_b_show, isg6320_normal_threshold_b_store);
@@ -2653,39 +2397,6 @@ static DEVICE_ATTR(change_freq_value, 0444,
 static DEVICE_ATTR(change_freq, 0444, isg6320_change_freq_show, NULL);
 #endif
 
-#if 0
-/* DO NOT SUBMIT */
-static ssize_t isg6320_make_i2c_fail_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
-{
-	struct isg6320_data *data = dev_get_drvdata(dev);
-
-	data->client->addr = 0x00;
-
-	pr_info("[GRIP_%d] %s - make slave addr 0 to make i2c fail\n",
-		data->ic_num, __func__);
-	return sprintf(buf, "make i2c fail\n");
-}
-static ssize_t isg6320_make_i2c_fail_store(struct device *dev,
-						   struct device_attribute *attr, const char *buf, size_t size)
-{
-	u8 buf8;
-	struct isg6320_data *data = dev_get_drvdata(dev);
-
-	sscanf(buf, "%x", &buf8);
-
-	data->client->addr = buf8;
-
-	pr_info("[GRIP_%d] %s - make slave addr %x to check i2c\n",
-		data->ic_num, __func__, buf8);
-
-	return size;
-}
-
-static DEVICE_ATTR(i2c_fail, 0664,
-		   isg6320_make_i2c_fail_show, isg6320_make_i2c_fail_store);
-#endif
-
 static struct device_attribute *sensor_attrs[] = {
 	&dev_attr_name,
 	&dev_attr_vendor,
@@ -2715,6 +2426,7 @@ static struct device_attribute *sensor_attrs[] = {
 #if defined(CONFIG_TABLET_MODEL_CONCEPT)
 	&dev_attr_country_code,
 #endif
+	//&dev_attr_cml,
 #if !defined(CONFIG_SEC_FACTORY) && defined(CONFIG_SUPPORT_MCC_THRESHOLD_CHANGE)
 	&dev_attr_mcc,
 #endif
@@ -2733,15 +2445,6 @@ static struct device_attribute *sensor_attrs[] = {
 	&dev_attr_change_freq_value,
 	&dev_attr_change_freq,
 #endif
-
-
-#if 0
-/* DO NOT SUBMIT */
-	&dev_attr_i2c_fail,
-#endif
-
-
-
 	NULL,
 };
 
@@ -2784,44 +2487,16 @@ static void init_work_func(struct work_struct *work)
 	struct isg6320_data *data = container_of(delayed_work,
 						  struct isg6320_data, init_work);
 
-	isg6320_reset(data);
 	isg6320_initialize(data);
 	isg6320_set_debug_work(data, ON, SHCEDULE_INTERVAL);
 }
 #endif
 
-static void invalid_cfcal_work_func(struct work_struct *work)
-{
-	struct delayed_work *delayed_work = to_delayed_work(work);
-	struct isg6320_data *data = container_of(delayed_work,
-						  struct isg6320_data, invalid_cfcal_work);
-	int ret = 0;
-
-	pr_info("[GRIP_%d] invalid_cal start\n", data->ic_num);
-	ret = isg6320_force_calibration(data);
-
-	if (ret < 0) {
-		if (data->reset_fail_cnt < 5)
-			data->reset_fail_cnt++;
-		if (data->reset_fail_cnt >= 2) {
-			isg6320_enter_error_mode(data, FAIL_RESET);
-			pr_err("[GRIP_%d] %s enter abnormal mode\n", data->ic_num, __func__);
-		}
-	} else {
-		data->reset_fail_cnt = 0;
-	}
-}
-
 static void isg6320_check_first_working(struct isg6320_data *data, int channel_num)
 {
-	if (data->check_abnormal_working == true) {
-		pr_err("[GRIP_%d] skip first working detected\n", data->ic_num);
-		return;
-	}
-
-	if (data->noti_enable && data->motion) {
+	if (data->noti_enable) {
 		if (channel_num == 1) {
-			if (data->normal_th != 0 && data->normal_th < data->diff) {
+			if (data->normal_th < data->diff) {
 				if (!data->first_working) {
 					data->first_working = true;
 					pr_info("[GRIP_%d] first working detected %d\n", data->ic_num, data->diff);
@@ -2834,10 +2509,12 @@ static void isg6320_check_first_working(struct isg6320_data *data, int channel_n
 				}
 			}
 		}
+	}
 #ifdef CONFIG_USE_MULTI_CHANNEL
-		else if (channel_num == 2) {
-			if (data->multi_use) {
-				if (data->mul_ch->normal_th_b != 0 && data->mul_ch->normal_th_b < data->mul_ch->diff_b) {
+	if (data->multi_use) {
+		if (data->mul_ch->noti_enable) {
+			if (channel_num == 2) {
+				if (data->mul_ch->normal_th_b < data->mul_ch->diff_b) {
 					if (!data->mul_ch->first_working) {
 						data->mul_ch->first_working = true;
 						pr_info("[GRIP_%d] [B] first working detected %d\n", data->ic_num, data->mul_ch->diff_b);
@@ -2851,25 +2528,22 @@ static void isg6320_check_first_working(struct isg6320_data *data, int channel_n
 				}
 			}
 		}
-#endif
 	}
+#endif
 }
 
 static void cal_work_func(struct work_struct *work)
 {
-
 	struct delayed_work *delayed_work = to_delayed_work(work);
 	struct isg6320_data *data = container_of(delayed_work,
 						  struct isg6320_data, cal_work);
 	bool force_cal = false;
-	bool invalid_cal = false;
 	int ret = 0;
 
 	if (data->abnormal_mode && data->enable == ON) {
 		ret = isg6320_get_raw_data(data, true);
 		if (ret < 0) {
-			if (data->check_abnormal_working == false)
-				schedule_delayed_work(&data->cal_work, msecs_to_jiffies(SHCEDULE_INTERVAL));
+			schedule_delayed_work(&data->cal_work, msecs_to_jiffies(SHCEDULE_INTERVAL));
 			return;
 		}
 		if (data->max_normal_diff < data->diff)
@@ -2882,11 +2556,6 @@ static void cal_work_func(struct work_struct *work)
 #endif
 	} else {
 		ret = isg6320_get_raw_data(data, false);
-		if (ret < 0) {
-			if (data->check_abnormal_working == false)
-				schedule_delayed_work(&data->cal_work, msecs_to_jiffies(SHCEDULE_INTERVAL));
-			return;
-		}
 		if (data->is_unknown_mode == UNKNOWN_ON && data->motion && !data->first_working)
 			isg6320_check_first_working(data, 1);
 #ifdef CONFIG_USE_MULTI_CHANNEL
@@ -2895,6 +2564,10 @@ static void cal_work_func(struct work_struct *work)
 				isg6320_check_first_working(data, 2);
 		}
 #endif
+		if (ret < 0) {
+			schedule_delayed_work(&data->cal_work, msecs_to_jiffies(SHCEDULE_INTERVAL));
+			return;
+		}
 	}
 
 #if defined(CONFIG_SEC_FACTORY)
@@ -2911,9 +2584,8 @@ static void cal_work_func(struct work_struct *work)
 		if (enable_backup)
 			isg6320_set_enable(data, ON);
 
-		if (data->check_abnormal_working == false)
-			schedule_delayed_work(&data->cal_work,
-				msecs_to_jiffies(data->schedule_time));
+		schedule_delayed_work(&data->cal_work,
+			msecs_to_jiffies(data->schedule_time));
 		return;
 	}
 #endif
@@ -2923,11 +2595,6 @@ static void cal_work_func(struct work_struct *work)
 			data->cfcal_th);
 		force_cal = true;
 	}
-	if (data->invalid_count >= 3) {
-		pr_info("[GRIP_%d] invalid_cal\n", data->ic_num);
-		data->invalid_count = 0;
-		invalid_cal = true;
-	}
 #ifdef CONFIG_USE_MULTI_CHANNEL
 	if (data->multi_use) {
 		if (data->mul_ch->cdc_b < data->mul_ch->cfcal_th_b) {
@@ -2935,17 +2602,9 @@ static void cal_work_func(struct work_struct *work)
 				data->mul_ch->cdc_b, data->mul_ch->cfcal_th_b);
 			force_cal = true;
 		}
-		if (data->mul_ch->invalid_count_b >= 3) {
-			pr_info("[GRIP_%d] [B] invalid_cal\n", data->ic_num);
-			data->mul_ch->invalid_count_b = 0;
-			invalid_cal = true;
-		}
 	}
 #endif
-	if (invalid_cal) {
-		data->schedule_time = SHCEDULE_INTERVAL;
-		schedule_delayed_work(&data->invalid_cfcal_work, 0);
-	} else if (force_cal) {
+	if (force_cal) {
 		data->schedule_time = SHCEDULE_INTERVAL;
 		schedule_work(&data->cfcal_work);
 	} else if (data->abnormal_mode == OFF) {
@@ -2953,8 +2612,7 @@ static void cal_work_func(struct work_struct *work)
 			data->schedule_time += SHCEDULE_INTERVAL + (data->ic_num << 2);
 	}
 
-	if (data->check_abnormal_working == false)
-		schedule_delayed_work(&data->cal_work,
+	schedule_delayed_work(&data->cal_work,
 			msecs_to_jiffies(data->schedule_time));
 }
 
@@ -3036,6 +2694,9 @@ static int isg6320_hall_notifier(struct notifier_block *nb,
 #endif
 	} else {
 		pr_info("[GRIP_%d] %s detach\n", data->ic_num, hall_notifier->name);
+#if !IS_ENABLED(CONFIG_TABLET_MODEL_CONCEPT)
+		isg6320_enter_unknown_mode(data, TYPE_HALL);
+#endif
 	}
 	return 0;
 }
@@ -3058,6 +2719,7 @@ static int isg6320_fcd_notifier(struct notifier_block *nb,
 #endif
 
 #if defined(CONFIG_TABLET_MODEL_CONCEPT)
+#if IS_ENABLED(CONFIG_KEYBOARD_STM32_POGO_V3) || IS_ENABLED(CONFIG_KEYBOARD_STM32_POGO_V2) || IS_ENABLED(CONFIG_KEYBOARD_STM32_POGO)
 static int isg6320_pogo_notifier(struct notifier_block *nb,
 		unsigned long action, void *pogo_data)
 {
@@ -3078,6 +2740,7 @@ static int isg6320_pogo_notifier(struct notifier_block *nb,
 	return 0;
 }
 #endif
+#endif
 
 static int isg6320_parse_dt(struct isg6320_data *data, struct device *dev)
 {
@@ -3090,6 +2753,11 @@ static int isg6320_parse_dt(struct isg6320_data *data, struct device *dev)
 #if defined(CONFIG_SENSORS_ISG6320_SUB)
 	else if (data->ic_num == SUB_GRIP)
 		data->gpio_int = of_get_named_gpio_flags(node, "isg6320_sub,irq-gpio", 0,
+							&flags);
+#endif
+#if defined(CONFIG_SENSORS_ISG6320_SUB2)
+	else if (data->ic_num == SUB2_GRIP)
+		data->gpio_int = of_get_named_gpio_flags(node, "isg6320_sub2,irq-gpio", 0,
 							&flags);
 #endif
 #if defined(CONFIG_SENSORS_ISG6320_WIFI)
@@ -3110,6 +2778,10 @@ static int isg6320_parse_dt(struct isg6320_data *data, struct device *dev)
 	else if (data->ic_num == SUB_GRIP)
 		ret = of_property_read_u32(node, "isg6320_sub,reg_num", &data->reg_size);
 #endif
+#if defined(CONFIG_SENSORS_ISG6320_SUB2)
+	else if (data->ic_num == SUB2_GRIP)
+		ret = of_property_read_u32(node, "isg6320_sub2,reg_num", &data->reg_size);
+#endif
 #if defined(CONFIG_SENSORS_ISG6320_WIFI)
 	else if (data->ic_num == WIFI_GRIP)
 		ret = of_property_read_u32(node, "isg6320_wifi,reg_num", &data->reg_size);
@@ -3124,6 +2796,11 @@ static int isg6320_parse_dt(struct isg6320_data *data, struct device *dev)
 #if defined(CONFIG_SENSORS_ISG6320_SUB)
 	else if (data->ic_num == SUB_GRIP)
 		ret = of_property_read_u8_array(node, "isg6320_sub,set_reg", data->setup_reg,
+						data->reg_size * 2);
+#endif
+#if defined(CONFIG_SENSORS_ISG6320_SUB2)
+	else if (data->ic_num == SUB2_GRIP)
+		ret = of_property_read_u8_array(node, "isg6320_sub2,set_reg", data->setup_reg,
 						data->reg_size * 2);
 #endif
 #if defined(CONFIG_SENSORS_ISG6320_WIFI)
@@ -3143,6 +2820,10 @@ static int isg6320_parse_dt(struct isg6320_data *data, struct device *dev)
 	else if (data->ic_num == SUB_GRIP)
 		ret = of_property_read_u32(node, "isg6320_sub,multi_use", &data->multi_use);
 #endif
+#if defined(CONFIG_SENSORS_ISG6320_SUB2)
+	else if (data->ic_num == SUB2_GRIP)
+		ret = of_property_read_u32(node, "isg6320_sub2,multi_use", &data->multi_use);
+#endif
 #if defined(CONFIG_SENSORS_ISG6320_WIFI)
 	else if (data->ic_num == WIFI_GRIP)
 		ret = of_property_read_u32(node, "isg6320_wifi,multi_use", &data->multi_use);
@@ -3150,6 +2831,24 @@ static int isg6320_parse_dt(struct isg6320_data *data, struct device *dev)
 	if (ret < 0) {
 		pr_err("[GRIP_%d] multi_use set err\n", data->ic_num);
 		data->multi_use = 0;
+	}
+	if (data->ic_num == MAIN_GRIP)
+		ret = of_property_read_u32(node, "isg6320,unknown_ch_selection", &data->unknown_ch_selection);
+#if defined(CONFIG_SENSORS_ISG6320_SUB)
+	else if (data->ic_num == SUB_GRIP)
+		ret = of_property_read_u32(node, "isg6320_sub,unknown_ch_selection", &data->unknown_ch_selection);
+#endif
+#if defined(CONFIG_SENSORS_ISG6320_SUB2)
+	else if (data->ic_num == SUB2_GRIP)
+		ret = of_property_read_u32(node, "isg6320_sub2,unknown_ch_selection", &data->unknown_ch_selection);
+#endif
+#if defined(CONFIG_SENSORS_ISG6320_WIFI)
+	else if (data->ic_num == WIFI_GRIP)
+		ret = of_property_read_u32(node, "isg6320_wifi,unknown_ch_selection", &data->unknown_ch_selection);
+#endif
+	if (ret < 0) {
+		pr_err("[GRIP_%d] fail select unknown ch\n", data->ic_num);
+		data->unknown_ch_selection = 3;
 	}
 #if !defined(CONFIG_SEC_FACTORY) && defined(CONFIG_SUPPORT_MCC_THRESHOLD_CHANGE)
 	if (data->ic_num == MAIN_GRIP) {
@@ -3168,11 +2867,6 @@ static int isg6320_parse_dt(struct isg6320_data *data, struct device *dev)
 		pr_info("[GRIP_%d] mcc_hysteresis = 0x%X\n", data->ic_num, data->mcc_hysteresis);
 	}
 #endif
-	ret = of_property_read_u8(node, "isg6320,force_report_unknown", &data->force_report_unknown);
-	if (ret < 0) {
-		pr_err("[GRIP_%d] force_report_unknown set err\n", data->ic_num);
-		data->force_report_unknown = 0;
-	}
 
 	return 0;
 }
@@ -3197,18 +2891,6 @@ static int isg6320_gpio_init(struct isg6320_data *data)
 
 	return ret;
 }
-#if defined(CONFIG_SENSORS_DUMP_DATA)
-int isg6320_dump_data_notify(struct notifier_block *nb,
-	unsigned long val, void *v)
-{
-	struct isg6320_data *data = container_of(nb, struct isg6320_data, dump_nb);
-
-	if ((val == 1) && (data != NULL)) {
-		pr_info("[GRIP_%d] err state %d\n", data->ic_num, data->err_state);	
-	}
-	return 0;
-}
-#endif
 
 static int isg6320_probe(struct i2c_client *client,
 			  const struct i2c_device_id *id)
@@ -3226,6 +2908,10 @@ static int isg6320_probe(struct i2c_client *client,
 #if defined(CONFIG_SENSORS_ISG6320_SUB)
 	else if (strcmp(client->name, "isg6320_sub") == 0)
 		ic_num = SUB_GRIP;
+#endif
+#if defined(CONFIG_SENSORS_ISG6320_SUB2)
+	else if (strcmp(client->name, "isg6320_sub2") == 0)
+		ic_num = SUB2_GRIP;
 #endif
 #if defined(CONFIG_SENSORS_ISG6320_WIFI)
 	else if (strcmp(client->name, "isg6320_wifi") == 0)
@@ -3300,6 +2986,7 @@ static int isg6320_probe(struct i2c_client *client,
 	noti_input_dev = input_allocate_device();
 	if (!noti_input_dev) {
 		pr_err("[GRIP_%d] input_allocate_device failed\n", data->ic_num);
+		input_free_device(input_dev);
 		goto err_noti_input_alloc;
 	}
 
@@ -3315,6 +3002,8 @@ static int isg6320_probe(struct i2c_client *client,
 	ret = isg6320_reset(data);
 	if (ret < 0) {
 		pr_err("[GRIP_%d] reset fail\n", data->ic_num);
+		input_free_device(input_dev);
+		input_free_device(noti_input_dev);
 		goto err_soft_reset;
 	}
 
@@ -3350,17 +3039,18 @@ static int isg6320_probe(struct i2c_client *client,
 
 	if (ret < 0) {
 		pr_err("[GRIP_%d] fail to reg client->irq %d err %d\n", client->irq, data->ic_num, ret);
+		input_free_device(input_dev);
+		input_free_device(noti_input_dev);
 		goto err_irq;
 	}
 	disable_irq(client->irq);
-	data->is_irq_active = false;
-
 	mutex_init(&data->lock);
 
 	ret = input_register_device(input_dev);
 	if (ret) {
-		input_free_device(input_dev);
 		pr_err("[GRIP_%d] fail to reg input dev %d\n", data->ic_num, ret);
+		input_free_device(input_dev);
+		input_free_device(noti_input_dev);
 		goto err_register_input_dev;
 	}
 
@@ -3369,12 +3059,14 @@ static int isg6320_probe(struct i2c_client *client,
 					 input_dev->name);
 	if (ret < 0) {
 		pr_err("[GRIP_%d] fail to create symlink %d\n", data->ic_num, ret);
+		input_free_device(noti_input_dev);
 		goto err_create_symlink;
 	}
 
 	ret = sysfs_create_group(&data->input_dev->dev.kobj, &isg6320_attribute_group);
 	if (ret < 0) {
 		pr_err("[GRIP_%d] fail to create sysfs group (%d)\n", data->ic_num, ret);
+		input_free_device(noti_input_dev);
 		goto err_sysfs_create_group;
 	}
 
@@ -3386,6 +3078,7 @@ static int isg6320_probe(struct i2c_client *client,
 
 		if (SENSOR_ATTR_SIZE < multi_sensor_attrs_size + sensor_attrs_size) {
 			pr_err("failed : mem size of sensor_attr is exceeded : %d, %d\n", multi_sensor_attrs_size, sensor_attrs_size);
+			input_free_device(noti_input_dev);
 			goto err_sysfs_create_group;
 		}
 		memcpy(grip_sensor_attrs + sensor_attrs_size - 1, multi_sensor_attrs, sizeof(multi_sensor_attrs));
@@ -3399,13 +3092,20 @@ static int isg6320_probe(struct i2c_client *client,
 
 	if (ret) {
 		pr_err("[GRIP_%d] fail to reg sensor(%d)\n", data->ic_num, ret);
+		input_free_device(noti_input_dev);
 		goto err_sensor_register;
 	}
-	ret = input_register_device(noti_input_dev);
+
+	if (data->unknown_ch_selection)
+		ret = input_register_device(noti_input_dev);
+	else
+		ret = -1;
+
 	if (ret) {
 		input_free_device(noti_input_dev);
 		pr_err("[GRIP_U] failed to register input dev for noti (%d)\n", ret);
-		goto err_register_input_dev_noti;
+		if (data->unknown_ch_selection)
+			goto err_register_input_dev_noti;
 	}
 #else //!CONFIG_SENSORS_CORE_AP
 	ret = sensors_create_symlink(input_dev);
@@ -3433,28 +3133,32 @@ static int isg6320_probe(struct i2c_client *client,
 		memcpy(grip_sensor_attrs + sensor_attrs_size - 1, multi_sensor_attrs, sizeof(multi_sensor_attrs));
 	}
 
-	ret = sensors_register(data->dev, data, grip_sensor_attrs,
+	ret = sensors_register(&data->dev, data, grip_sensor_attrs,
 				(char *)module_name[data->ic_num]);
 #else
-	ret = sensors_register(data->dev, data, sensor_attrs,
+	ret = sensors_register(&data->dev, data, sensor_attrs,
 				(char *)module_name[data->ic_num]);
 #endif
 	if (ret) {
 		pr_err("[GRIP_%d] fail to reg sensor(%d).\n", data->ic_num, ret);
 		goto err_sensor_register;
 	}
-	ret = input_register_device(noti_input_dev);
+	if (data->unknown_ch_selection)
+		ret = input_register_device(noti_input_dev);
+	else
+		ret = -1;
+
 	if (ret) {
 		input_free_device(noti_input_dev);
 		pr_err("[GRIP_U] failed to register input dev for noti (%d)\n", ret);
-		goto err_register_input_dev_noti;
+		if (data->unknown_ch_selection)
+			goto err_register_input_dev_noti;
 	}
 #endif
 
 	data->grip_ws = wakeup_source_register(&client->dev, "grip_wake_lock");
 	INIT_WORK(&data->irq_work, irq_work_func);
 	INIT_WORK(&data->cfcal_work, cfcal_work_func);
-	INIT_DELAYED_WORK(&data->invalid_cfcal_work, invalid_cfcal_work_func);
 	INIT_DELAYED_WORK(&data->cal_work, cal_work_func);
 #if !defined(CONFIG_SEC_FACTORY) && defined(CONFIG_SUPPORT_MCC_THRESHOLD_CHANGE)
 	INIT_WORK(&data->mcc_work, mcc_work_func);
@@ -3489,25 +3193,16 @@ static int isg6320_probe(struct i2c_client *client,
 #endif
 
 #if defined(CONFIG_TABLET_MODEL_CONCEPT)
+#if IS_ENABLED(CONFIG_KEYBOARD_STM32_POGO_V3) || IS_ENABLED(CONFIG_KEYBOARD_STM32_POGO_V2) || IS_ENABLED(CONFIG_KEYBOARD_STM32_POGO)
 	pogo_notifier_register(&data->pogo_nb, isg6320_pogo_notifier, POGO_NOTIFY_DEV_SENSOR);
 #endif
-#if defined(CONFIG_SENSORS_DUMP_DATA)
-	//for sec dump  -----
-	data->dump_nb.notifier_call = isg6320_dump_data_notify;
-	data->dump_nb.priority = 1;
-	{
-		int ret;
-		ret = sensordump_notifier_register(&data->dump_nb);
-		pr_info("[GRIP_%d] notifier %d", data->ic_num, ret);
-	}
-
 #endif
 	pr_info("[GRIP_%d] # probe done #\n", data->ic_num);
 
 	return 0;
 
-err_sensor_register:
 err_register_input_dev_noti:
+err_sensor_register:
 	sysfs_remove_group(&input_dev->dev.kobj, &isg6320_attribute_group);
 err_sysfs_create_group:
 #if defined(CONFIG_SENSORS_CORE_AP)
@@ -3624,6 +3319,149 @@ static struct i2c_device_id isg6320_id_table[] = {
 };
 MODULE_DEVICE_TABLE(i2c, isg6320_id_table);
 
+#if defined(CONFIG_SENSORS_GRIP_SCANOFF) && !defined(CONFIG_SEC_FACTORY)
+static void scanoff_work_func(struct work_struct *work)
+{
+	struct isg6320_data *data = container_of((struct work_struct *)work,
+						struct isg6320_data, scanoff_work);
+	int ret;
+	u8 buf;
+
+	ret = isg6320_i2c_write(data, ISG6320_WUTDATA_REG, 0x01);
+	if (ret < 0) {
+		pr_err("[GRIP_%d] Scan Rate(1) failed (%d)\n", data->ic_num, ret);
+	}
+	ret = isg6320_i2c_write(data, ISG6320_WUTDATA_LSB_REG, 0x80);
+	if (ret < 0) {
+		pr_err("[GRIP_%d] Scan Rate(2) failed (%d)\n", data->ic_num, ret);
+	}
+
+	ret = isg6320_i2c_write(data, ISG6320_ACTSCAN_REG, SCAN_OFF_CMD);
+	if (ret < 0) {
+		pr_err("[GRIP_%d] Scan Off failed (%d)\n", data->ic_num, ret);
+		goto err;
+	}
+	isg6320_i2c_read(data, ISG6320_ACTSCAN_REG, &buf, 1);
+	pr_info("[GRIP_%d] read 0x%02X 0x%02X (w 0x%02X)\n", data->ic_num, ISG6320_ACTSCAN_REG, buf, SCAN_OFF_CMD);
+
+	ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_DFE_ENABLE);
+	if (ret < 0) {
+		pr_err("[GRIP_%d] Scan Stop failed (%d)\n", data->ic_num, ret);
+		goto err;
+	}
+	isg6320_i2c_read(data, ISG6320_SCANCTRL1_REG, &buf, 1);
+	pr_info("[GRIP_%d] read 0x%02X 0x%02X (w 0x%02X)\n", data->ic_num, ISG6320_SCANCTRL1_REG, buf, ISG6320_DFE_ENABLE);
+
+	usleep_range(10000, 10010);
+	ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, 0x00);
+	if (ret < 0) {
+		pr_err("[GRIP_%d] AFE Off failed (%d)\n", data->ic_num, ret);
+		goto err;
+	}
+	isg6320_i2c_read(data, ISG6320_SCANCTRL1_REG, &buf, 1);
+	pr_info("[GRIP_%d] read 0x%02X 0x%02X (w 0x%02X)\n", data->ic_num, ISG6320_SCANCTRL1_REG, buf, 0x00);
+
+	msleep(100);
+	ret = isg6320_i2c_write(data, ISG6320_SCANCTRL1_REG, ISG6320_CFCAL_START);
+	if (ret < 0) {
+		pr_err("[GRIP_%d] Calibration failed (%d)\n", data->ic_num, ret);
+		goto err;
+	}
+
+	pr_info("[GRIP_%d] scan off setting done, cal start\n", data->ic_num);
+
+	return;
+err:
+	pr_err("[GRIP_%d] scan off setting fail\n", data->ic_num);
+}
+
+static int isg6320_sm_probe(struct i2c_client *client,
+			  const struct i2c_device_id *id)
+{
+	struct isg6320_data *data;
+	int ic_num = MAIN_GRIP;
+
+	if (strcmp(client->name, "isg6320") == 0)
+		ic_num = MAIN_GRIP;
+	else
+		goto err;
+
+	pr_info("[GRIP_%d] %s # scan off probe #\n", ic_num, device_name[ic_num]);
+
+	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
+		pr_info("[GRIP_%d] i2c_check_functionality err\n", ic_num);
+		goto err;
+	}
+
+	data = kzalloc(sizeof(struct isg6320_data), GFP_KERNEL);
+	if (!data) {
+		pr_info("[GRIP_%d] fail to alloc mem\n", ic_num);
+		goto err_kzalloc;
+	}
+
+	data->ic_num = ic_num;
+	data->client = client;
+	i2c_set_clientdata(client, data);
+
+	INIT_WORK(&data->scanoff_work, scanoff_work_func);
+	schedule_work(&data->scanoff_work);
+
+	return 0;
+
+err_kzalloc:
+err:
+	pr_err("[GRIP_%d] # scan off probe fail \n", ic_num);
+
+	return -ENODEV;
+}
+
+static int isg6320_sm_suspend(struct device *dev)
+{
+	pr_info("%s\n", __func__);
+
+	return 0;
+}
+
+static int isg6320_sm_resume(struct device *dev)
+{
+	pr_info("%s\n", __func__);
+
+	return 0;
+}
+
+static int isg6320_sm_remove(struct i2c_client *client)
+{
+	struct isg6320_data *data = i2c_get_clientdata(client);
+
+	pr_info("[GRIP_%d] %s\n", data->ic_num, __func__);
+	kfree(data);
+
+	return 0;
+}
+
+static void isg6320_sm_shutdown(struct i2c_client *client)
+{
+	pr_info("%s\n", __func__);
+}
+
+static const struct dev_pm_ops isg6320_sm_pm_ops = {
+	.suspend = isg6320_sm_suspend,
+	.resume = isg6320_sm_resume,
+};
+
+static struct i2c_driver isg6320_driver_sm = {
+	.driver = {
+		.name = isg6320_id_table[0].name,
+		.owner = THIS_MODULE,
+		.of_match_table = isg6320_match_table,
+		.pm = &isg6320_sm_pm_ops,
+	},
+	.id_table = isg6320_id_table,
+	.probe = isg6320_sm_probe,
+	.remove = isg6320_sm_remove,
+	.shutdown = isg6320_sm_shutdown,
+};
+#endif //CONFIG_SENSORS_GRIP_SCANOFF
 
 static struct i2c_driver isg6320_driver = {
 	.driver = {
@@ -3664,6 +3502,32 @@ static struct i2c_driver isg6320_sub_driver = {
 };
 #endif
 
+#if defined(CONFIG_SENSORS_ISG6320_SUB2)
+static const struct of_device_id isg6320_sub2_match_table[] = {
+	{ .compatible = "isg6320_sub2", },
+	{ },
+};
+
+static struct i2c_device_id isg6320_sub2_id_table[] = {
+	{"ISG6320_SUB2", 0},
+	{ },
+};
+MODULE_DEVICE_TABLE(i2c, isg6320_sub2_id_table);
+
+static struct i2c_driver isg6320_sub2_driver = {
+	.driver = {
+		.name = isg6320_sub2_id_table[0].name,
+		.owner = THIS_MODULE,
+		.of_match_table = isg6320_sub2_match_table,
+		.pm = &isg6320_pm_ops,
+	},
+	.id_table = isg6320_sub2_id_table,
+	.probe = isg6320_probe,
+	.remove = isg6320_remove,
+	.shutdown = isg6320_shutdown,
+};
+#endif
+
 #if defined(CONFIG_SENSORS_ISG6320_WIFI)
 static const struct of_device_id isg6320_wifi_match_table[] = {
 	{ .compatible = "isg6320_wifi", },
@@ -3693,19 +3557,25 @@ static struct i2c_driver isg6320_wifi_driver = {
 static int __init isg6320_init(void)
 {
 	int ret = 0;
-#if 0 //IS_ENABLED(CONFIG_BATTERY_SAMSUNG)
-	if (lpcharge) {
-		pr_err("lpm : Do not load driver\n");
-		return 0;
-	}
-#endif
+
+#if defined(CONFIG_SENSORS_GRIP_SCANOFF) && !defined(CONFIG_SEC_FACTORY) //only main grip.
+	ret = i2c_add_driver(&isg6320_driver_sm);
+	if (ret != 0)
+		pr_err("isg6320_driver_sm probe fail\n");
+#else
 	ret = i2c_add_driver(&isg6320_driver);
 	if (ret != 0)
 		pr_err("isg6320_driver probe fail\n");
+#endif
 #if defined(CONFIG_SENSORS_ISG6320_SUB)
 	ret = i2c_add_driver(&isg6320_sub_driver);
 	if (ret != 0)
 		pr_err("isg6320_sub_driver probe fail\n");
+#endif
+#if defined(CONFIG_SENSORS_ISG6320_SUB2)
+	ret = i2c_add_driver(&isg6320_sub2_driver);
+	if (ret != 0)
+		pr_err("isg6320_sub2_driver probe fail\n");
 #endif
 #if defined(CONFIG_SENSORS_ISG6320_WIFI)
 	ret = i2c_add_driver(&isg6320_wifi_driver);
@@ -3721,6 +3591,9 @@ static void __exit isg6320_exit(void)
 	i2c_del_driver(&isg6320_driver);
 #if defined(CONFIG_SENSORS_ISG6320_SUB)
 	i2c_del_driver(&isg6320_sub_driver);
+#endif
+#if defined(CONFIG_SENSORS_ISG6320_SUB2)
+	i2c_del_driver(&isg6320_sub2_driver);
 #endif
 #if defined(CONFIG_SENSORS_ISG6320_WIFI)
 	i2c_del_driver(&isg6320_wifi_driver);
