@@ -8689,7 +8689,7 @@ static int fastrpc_suspend_late(struct device *dev)
 					async_wait_queue dose not get triggred by wake_up_all or wake_up_interruptible_all.
 					Just because wake_up or wake_up_interruptible means that delay is only one thing we can do.
 					*/
-					if (list_empty(&fl->clst.async_queue)) {
+					if (hlist_empty(&fl->clst.async_queue)) {
 						cdsp_cid_async_empty_queue_cnt++;
 					}
 

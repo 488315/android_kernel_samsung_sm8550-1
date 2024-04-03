@@ -3722,7 +3722,7 @@ static void msm_geni_wakeup_work(struct work_struct *work)
 		return;
 	uport = &port->uport;
 	reinit_completion(&port->wakeup_comp);
-	if (msm_geni_serial_power_on(uport)) {
+	if (msm_geni_serial_power_on(uport, false)) {
 		atomic_set(&port->check_wakeup_byte, 0);
 		UART_LOG_DBG(port->ipc_log_rx, uport->dev,
 			     "%s:Failed to power on\n", __func__);
@@ -3734,7 +3734,7 @@ static void msm_geni_wakeup_work(struct work_struct *work)
 		UART_LOG_DBG(port->ipc_log_rx, uport->dev,
 			     "%s completion of wakeup_comp task timedout %dmsec\n",
 			     __func__, WAKEBYTE_TIMEOUT_MSEC);
-	msm_geni_serial_power_off(uport);
+	msm_geni_serial_power_off(uport, false);
 }
 
 static irqreturn_t msm_geni_wakeup_isr(int isr, void *dev)

@@ -124,8 +124,8 @@ struct ddr_stats_g_data {
 struct ddr_stats_g_data *ddr_gdata;
 #if IS_ENABLED(CONFIG_SEC_PM)
 #define MAX_SUBSYS_LEN	16
-static int max_subsys_count;
-static int subsys_names[MAX_SUBSYS_LEN];
+static int __maybe_unused max_subsys_count;
+static int __maybe_unused subsys_names[MAX_SUBSYS_LEN];
 #endif
 #endif
 
