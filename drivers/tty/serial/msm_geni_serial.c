@@ -3866,6 +3866,7 @@ static void msm_geni_serial_shutdown(struct uart_port *uport)
 		console_stop(uport->cons);
 		disable_irq(uport->irq);
 	} else {
+		int usage_count;
 		if (!msm_port->is_clk_aon)
 			msm_geni_serial_power_on(uport, false);
 
@@ -3956,7 +3957,6 @@ static void msm_geni_serial_shutdown(struct uart_port *uport)
 					__func__, ret);
 		}
 
-		int usage_count;
 		while(true) {
 			usage_count = atomic_read(&uport->dev->power.usage_count);
 			if (usage_count < 1)
