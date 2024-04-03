@@ -668,7 +668,6 @@ struct dwc3_msm {
 	struct if_cb_manager	*man;
 #endif
 	int cc_dir;
-	bool			force_disconnect;
 };
 
 static void toggle_timer(struct dwc3_msm *mdwc, bool toggle)
