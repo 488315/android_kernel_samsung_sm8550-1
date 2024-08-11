@@ -196,7 +196,9 @@ obj-y += regulator/pmic_class/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
 obj-y += vibrator/common/vib_info/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
 obj-y += misc/drb/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
 obj-y += uwb/uwb_logger/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
+ifneq ($(CONFIG_SEC_PLATFORM_GTS9WIFI), y)
 obj-y += sec_panel_notifier/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
+endif
 obj-y += net/dropdump/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
 obj-y += usb/common/vbus_notifier/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
 obj-y += battery/charger/max77705_charger/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
@@ -233,5 +235,21 @@ obj-y += battery/wireless/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
 ifeq ($(CONFIG_SEC_PLATFORM_DM3Q), y)
 obj-y += sensors/vl53l8/
 endif
+ifeq ($(CONFIG_SEC_PLATFORM_GTS9WIFI), y)
+obj-y += vibrator/common/
+obj-y += sec_panel_notifier_v2/
+obj-y += battery/charger/sm5440_charger/
+obj-y += battery/charger/sm5714_charger/
+obj-y += battery/fuelgauge/sm5714_fuelgauge/
+obj-y += mfd/sm/sm5714/
+obj-y += redriver/ps5169/
+obj-y += input/touchscreen/stm/fts1ba90a/
+obj-y += muic/sm/sm5714/
+obj-y += usb/typec/sm/sm5714/
+obj-y += input/sec_input/stm32/
+obj-y += input/wacom_tablet/
+obj-y += vibrator/dc/
+endif
+
 obj-y += input/sec_input/stm_spi/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
 obj-y += mfd/slsi/s2mpb02/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT

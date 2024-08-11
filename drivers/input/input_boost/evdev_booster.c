@@ -46,14 +46,16 @@ struct ib_event_work *ib_evt_work;
 int ib_work_cnt;
 
 int ib_notifier_register(struct notifier_block *nb) {
-	/* nothing to do here */
-	return 0;
+    /* nothing to do here */
+    return 0;
 }
+EXPORT_SYMBOL(ib_notifier_register);
 
 int ib_notifier_unregister(struct notifier_block *nb) {
-	/* nothing to do here */
-	return 0;
+    /* nothing to do here */
+    return 0;
 }
+EXPORT_SYMBOL(ib_notifier_unregister);
 
 static void evdev_ib_trigger(struct work_struct* work)
 {
